@@ -1,0 +1,70 @@
+flowchart TD
+    START([Monthly trigger<br/>2nd of month, 07:00]) --> F
+
+    subgraph FETCH [" 01 · FETCH — S3 "]
+        F[List new books + status files<br/>Date Added = load date S]
+    end
+
+    F --> PLAN
+
+    subgraph PLANNING [" 02 · PLAN — the one human step "]
+        PLAN[/"Operator assigns campaign per book<br/>PreX or Bucket · days if PDD+n is new<br/>defaults cached from last month"/]
+        PLAN --> PM["npm run plan<br/>load date → days → status files → exports"]
+        PM --> W{"Any<br/>warning?"}
+    end
+
+    W -->|"unknown PDD+n<br/>campaign inferred<br/>due date ≠ S + n"| STOP1[["STOP — ask a human"]]
+    W -->|clean| EXP
+
+    subgraph EXPORT [" 03 · EXPORT — Convin, one job at a time "]
+        EXP[Trigger export for cohort] --> VER{"request_params<br/>match intent?"}
+        VER -->|no — filter drift| EXP
+        VER -->|yes| POLL[Poll /report-downloads/active]
+        POLL --> ST{Status}
+        ST -->|processing| POLL
+        ST -->|"failed / hung > 20 min"| RETRY{"retries<br/>left?"}
+        RETRY -->|yes| EXP
+        RETRY -->|no| STOP2[["STOP — escalate<br/>never record as 'no calls'"]]
+        ST -->|completed| NEXT{More<br/>cohorts?}
+        NEXT -->|yes| EXP
+    end
+
+    NEXT -->|no| COL
+
+    subgraph COLLECT [" 04 · COLLECT "]
+        COL[Fetch CSV from email<br/>NOT the in-app notification] --> REP["npm run repair<br/>merge duplicate disposition cols<br/>assert one lead date per cohort"]
+        REP --> RC{"exit 0?"}
+    end
+
+    RC -->|no| STOP3[["STOP — unusable log"]]
+    RC -->|yes| ASM
+
+    subgraph ASSEMBLE [" 05 · ASSEMBLE "]
+        ASM["Slice cohort log by Call Timestamp<br/>book/Day N - date/{1,2,3}"]
+        ASM --> GAP{"Status file<br/>missing?"}
+        GAP -->|yes| REC[Build days that exist<br/>record gap in state]
+        GAP -->|no| BLD
+        REC --> BLD
+    end
+
+    subgraph BUILD [" 06–07 · BUILD + VERIFY "]
+        BLD["npm run reports --json"] --> V{"Accounts match book?<br/>AI attempts > 0?<br/>Cohort never over-counts?<br/>PDF valid?"}
+    end
+
+    V -->|any fail| STOP4[["STOP — do not ship<br/>a wrong report that looks right"]]
+    V -->|all pass| DONE([PDFs ready<br/>+ summary])
+
+    STOP1 -.-> ALERT[/"Alert the operator"/]
+    STOP2 -.-> ALERT
+    STOP3 -.-> ALERT
+    STOP4 -.-> ALERT
+
+    classDef human fill:#fde68a,stroke:#b45309,color:#1f2937
+    classDef stop fill:#fecaca,stroke:#b91c1c,color:#1f2937
+    classDef ok fill:#bbf7d0,stroke:#15803d,color:#1f2937
+    classDef work fill:#e0e7ff,stroke:#4338ca,color:#1f2937
+
+    class PLAN,ALERT human
+    class STOP1,STOP2,STOP3,STOP4 stop
+    class DONE ok
+    class F,PM,EXP,POLL,COL,REP,ASM,REC,BLD work

@@ -1,0 +1,362 @@
+{
+ "id": "rbl-notify",
+ "name": "RBL · Notify",
+ "nodes": [
+  {
+   "parameters": {
+    "inputSource": "workflowInputs",
+    "workflowInputs": {
+     "values": [
+      {
+       "name": "severity",
+       "type": "string"
+      },
+      {
+       "name": "runId",
+       "type": "string"
+      },
+      {
+       "name": "month",
+       "type": "string"
+      },
+      {
+       "name": "stage",
+       "type": "string"
+      },
+      {
+       "name": "title",
+       "type": "string"
+      },
+      {
+       "name": "body",
+       "type": "string"
+      },
+      {
+       "name": "resumeUrl",
+       "type": "string"
+      },
+      {
+       "name": "executionUrl",
+       "type": "string"
+      },
+      {
+       "name": "attachments",
+       "type": "string"
+      },
+      {
+       "name": "json",
+       "type": "object"
+      }
+     ]
+    }
+   },
+   "id": "nt-trigger",
+   "name": "When called",
+   "type": "n8n-nodes-base.executeWorkflowTrigger",
+   "typeVersion": 1.1,
+   "position": [
+    -460,
+    300
+   ],
+   "notes": "severity is one of info | stop | fail. A stop is the pipeline working correctly and must never render red."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Severity discipline lives here, and it matters more than it looks.\n\n   A \"stop\" is the pipeline WORKING: it found something it will not guess about\n   and asked. If routine stops arrive looking like failures, real failures stop\n   being alarming, and the whole point of having a distinct exit code 10 is\n   lost. So: amber, and the words \"awaiting a decision\". Red is reserved for\n   fail, and nothing else earns it. */\n\nconst inp = $input.first().json;\n\nconst SEVERITIES = {\n  info: { colour: '#2E7D32', icon: '✔', word: '' },\n  stop: { colour: '#E8A33D', icon: '⏸', word: 'awaiting a decision' },\n  fail: { colour: '#D14343', icon: '✘', word: 'FAILED' },\n};\nconst severity = SEVERITIES[inp.severity] ? inp.severity : 'info';\nconst sev = SEVERITIES[severity];\n\nconst month = String(inp.month ?? '').trim() || '(month unknown)';\nconst runId = String(inp.runId ?? '').trim() || '(no runId)';\nconst stage = String(inp.stage ?? '').trim();\nconst title = String(inp.title ?? '').trim() || (severity === 'fail' ? 'Pipeline failed' : 'Pipeline update');\nconst body = String(inp.body ?? '').trim();\nconst resumeUrl = String(inp.resumeUrl ?? '').trim();\nconst executionUrl = String(inp.executionUrl ?? '').trim();\nconst attachments = String(inp.attachments ?? '').trim();\n\n/* The first ~10 lines only. A stderr tail can be thousands of lines and Slack\n   will silently truncate the message — better to cut it deliberately and say\n   how much was cut than to have Slack decide where the story ends. */\nconst lines = body ? body.split('\\n') : [];\nconst shown = lines.slice(0, 10).join('\\n');\nconst more = lines.length > 10 ? '\\n… ' + (lines.length - 10) + ' more line(s) — see the execution' : '';\n\nconst headline = sev.icon + ' RBL ' + month + (sev.word ? ' — ' + sev.word : '') + ': ' + title;\n\nconst fields = [\n  { type: 'mrkdwn', text: '*Month*\\n' + month },\n  { type: 'mrkdwn', text: '*Run*\\n`' + runId + '`' },\n];\nif (stage) fields.push({ type: 'mrkdwn', text: '*Stage*\\n' + stage });\nfields.push({ type: 'mrkdwn', text: '*Severity*\\n' + severity });\n\nconst blocks = [\n  { type: 'header', text: { type: 'plain_text', text: headline.slice(0, 150), emoji: true } },\n  { type: 'section', fields },\n];\nif (shown) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '```' + (shown + more).slice(0, 2800) + '```' } });\n\n/* A stop is only actionable if the person reading it can act. The resume URL is\n   the whole difference between \"a decision is needed\" and \"someone must go and\n   find where to make it\". */\nconst links = [];\nif (resumeUrl) links.push('<' + resumeUrl + '|Make the decision>');\nif (executionUrl) links.push('<' + executionUrl + '|Open the execution>');\nif (links.length) blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: links.join('   ·   ') }] });\n\n/* Colour comes from the attachment wrapper — Block Kit itself has no colour. */\nconst slackPayload = { attachments: [{ color: sev.colour, blocks }] };\n\nconst emailSubject = 'RBL ' + month + ' — ' + (severity === 'fail' ? 'FAILED: ' : severity === 'stop' ? 'awaiting a decision: ' : '') + title;\nconst emailBody = [\n  headline,\n  '',\n  'Month:    ' + month,\n  'Run:      ' + runId,\n  stage ? 'Stage:    ' + stage : null,\n  'Severity: ' + severity,\n  '',\n  body || '(no detail)',\n  '',\n  resumeUrl ? 'DECIDE HERE: ' + resumeUrl : null,\n  executionUrl ? 'Execution:   ' + executionUrl : null,\n  severity === 'stop'\n    ? '\\nThis is not a failure. The pipeline stopped because it will not guess, and\\nnothing before this point has to be repeated when you resume.'\n    : null,\n].filter((l) => l !== null).join('\\n');\n\n/* Both channels are optional. A notifier that fails when Slack is unset would\n   take down the Error Handler that calls it, which is the one path that must\n   never go quiet. */\nconst slackWebhook = $vars.RBL_SLACK_WEBHOOK || '';\nconst emailTo = $vars.RBL_NOTIFY_TO || '';\n\nreturn [{\n  json: {\n    severity, month, runId, stage, title, body, resumeUrl, executionUrl, attachments,\n    colour: sev.colour,\n    hasSlack: !!slackWebhook,\n    hasEmail: !!emailTo,\n    emailTo,\n    slackWebhook,\n    slackPayload,\n    emailSubject,\n    emailBody,\n    json: inp.json ?? null,\n  },\n}];"
+   },
+   "id": "nt-format",
+   "name": "Format",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -240,
+    300
+   ],
+   "notes": "Severity → colour and wording. Amber \"awaiting a decision\" for stop; red for fail only."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "has-slack",
+       "leftValue": "={{ $json.hasSlack }}",
+       "rightValue": true,
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "nt-if-slack",
+   "name": "Slack configured?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    -20,
+    300
+   ],
+   "notes": "RBL_SLACK_WEBHOOK unset is a valid deployment, not an error. Both branches reach the email node."
+  },
+  {
+   "parameters": {
+    "method": "POST",
+    "url": "={{ $json.slackWebhook }}",
+    "sendBody": true,
+    "specifyBody": "json",
+    "jsonBody": "={{ JSON.stringify($json.slackPayload) }}",
+    "options": {
+     "timeout": 10000
+    }
+   },
+   "id": "nt-slack",
+   "name": "Post to Slack",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    200,
+    200
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "continueRegularOutput: a Slack outage must not swallow the email. The webhook URL is an n8n variable, never a literal here."
+  },
+  {
+   "parameters": {
+    "sendTo": "={{ $('Format').first().json.emailTo || $vars.RBL_NOTIFY_TO }}",
+    "subject": "={{ $('Format').first().json.emailSubject }}",
+    "message": "={{ $('Format').first().json.emailBody }}",
+    "options": {}
+   },
+   "id": "nt-email",
+   "name": "Send email",
+   "type": "n8n-nodes-base.gmail",
+   "typeVersion": 2.1,
+   "position": [
+    420,
+    300
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "Swap for Send Email (SMTP) or Slack-only if Gmail is not the channel — only sendTo/subject/message need copying. Credentials live in n8n, never in this file."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* What actually went out. The Error Handler and the Orchestrator both read\n   this: a notification that silently reached nobody is worse than one that\n   failed loudly, because the run then looks reported when it is not. */\nconst f = $('Format').first().json;\n\nlet slackOk = null;\nif (f.hasSlack) {\n  try {\n    const s = $('Post to Slack').first().json;\n    slackOk = !(s && (s.error || s.ok === false));\n  } catch (e) {\n    slackOk = false;\n  }\n}\n\nlet emailOk = null;\nif (f.hasEmail) {\n  try {\n    const e = $('Send email').first().json;\n    emailOk = !(e && e.error);\n  } catch (e) {\n    emailOk = false;\n  }\n}\n\nconst delivered = [f.hasSlack && slackOk ? 'slack' : null, f.hasEmail && emailOk ? 'email' : null].filter(Boolean);\n\nreturn [{\n  json: {\n    ok: delivered.length > 0,\n    severity: f.severity,\n    month: f.month,\n    runId: f.runId,\n    title: f.title,\n    delivered,\n    slack: f.hasSlack ? (slackOk ? 'sent' : 'FAILED') : 'not configured (RBL_SLACK_WEBHOOK unset)',\n    email: f.hasEmail ? (emailOk ? 'sent' : 'FAILED') : 'not configured (RBL_NOTIFY_TO unset)',\n    nobodyWasTold: delivered.length === 0,\n  },\n}];"
+   },
+   "id": "nt-sent",
+   "name": "Sent",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    640,
+    300
+   ],
+   "notes": "Reports which channels actually delivered. nobodyWasTold=true means the alert reached no one."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "loose",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "has-att",
+       "leftValue": "={{ $json.attachments }}",
+       "rightValue": "",
+       "operator": {
+        "type": "string",
+        "operation": "notEmpty",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "nt-if-att",
+   "name": "Has attachments?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    200,
+    420
+   ],
+   "notes": "Attachments ride only on the final delivery (§3.5) — every other notification is text."
+  },
+  {
+   "parameters": {
+    "operation": "read",
+    "fileSelector": "={{ $json.attachments }}",
+    "options": {
+     "dataPropertyName": "data"
+    }
+   },
+   "id": "nt-read-files",
+   "name": "Load the client documents",
+   "type": "n8n-nodes-base.readWriteFile",
+   "typeVersion": 1,
+   "position": [
+    420,
+    500
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "Reads the client PDFs off disk as binary. continueRegularOutput: a missing file must not swallow the delivery message."
+  },
+  {
+   "parameters": {
+    "sendTo": "={{ $('Format').first().json.emailTo || $vars.RBL_NOTIFY_TO }}",
+    "subject": "={{ $('Format').first().json.emailSubject }}",
+    "message": "={{ $('Format').first().json.emailBody }}",
+    "options": {
+     "attachmentsUi": {
+      "attachmentsBinary": [
+       {
+        "property": "data"
+       }
+      ]
+     }
+    }
+   },
+   "id": "nt-email-att",
+   "name": "Send email with attachments",
+   "type": "n8n-nodes-base.gmail",
+   "typeVersion": 2.1,
+   "position": [
+    640,
+    500
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput"
+  }
+ ],
+ "connections": {
+  "When called": {
+   "main": [
+    [
+     {
+      "node": "Format",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Format": {
+   "main": [
+    [
+     {
+      "node": "Slack configured?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Slack configured?": {
+   "main": [
+    [
+     {
+      "node": "Post to Slack",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Has attachments?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Post to Slack": {
+   "main": [
+    [
+     {
+      "node": "Has attachments?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Send email": {
+   "main": [
+    [
+     {
+      "node": "Sent",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Has attachments?": {
+   "main": [
+    [
+     {
+      "node": "Load the client documents",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Send email",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Load the client documents": {
+   "main": [
+    [
+     {
+      "node": "Send email with attachments",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Send email with attachments": {
+   "main": [
+    [
+     {
+      "node": "Sent",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v1",
+  "saveExecutionProgress": true,
+  "saveDataSuccessExecution": "all",
+  "saveDataErrorExecution": "all",
+  "errorWorkflow": "rbl-error-handler"
+ },
+ "pinData": {}
+}

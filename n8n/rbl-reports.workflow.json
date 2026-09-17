@@ -1,0 +1,245 @@
+{
+ "id": "rbl-reports",
+ "name": "RBL \u2014 build PDD book reports",
+ "nodes": [
+  {
+   "parameters": {},
+   "id": "manual-trigger",
+   "name": "Run manually",
+   "type": "n8n-nodes-base.manualTrigger",
+   "typeVersion": 1,
+   "position": [
+    -460,
+    40
+   ]
+  },
+  {
+   "parameters": {
+    "rule": {
+     "interval": [
+      {
+       "field": "cronExpression",
+       "expression": "0 7 2 * *"
+      }
+     ]
+    }
+   },
+   "id": "schedule-trigger",
+   "name": "Monthly (2nd, 07:00) \u2014 disabled",
+   "type": "n8n-nodes-base.scheduleTrigger",
+   "typeVersion": 1.2,
+   "position": [
+    -460,
+    240
+   ],
+   "disabled": true
+  },
+  {
+   "parameters": {
+    "command": "=cd \"{{ $vars.RBL_REPO }}\" && npm run reports -- --dry-run --json 2>&1 | tail -1"
+   },
+   "id": "plan",
+   "name": "Plan (dry run)",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    -200,
+    140
+   ],
+   "notes": "Lists what would be built without touching the database. Fails fast if the data root or repo path is wrong."
+  },
+  {
+   "parameters": {
+    "jsCode": "const raw = $input.first().json.stdout || '';\nlet plan;\ntry { plan = JSON.parse(raw.trim().split('\\n').pop()); }\ncatch (e) { throw new Error('Could not parse the planner output. Raw:\\n' + raw.slice(0, 600)); }\nif (!plan.wouldBuild) throw new Error('Nothing to build \u2014 check RBL_DATA_ROOT points at the book folders.');\nreturn [{ json: plan }];"
+   },
+   "id": "parse-plan",
+   "name": "Parse plan",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    20,
+    140
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=cd \"{{ $vars.RBL_REPO }}\" && npm run reports -- --json 2>&1 | tail -1"
+   },
+   "id": "build",
+   "name": "Build all reports",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    240,
+    140
+   ],
+   "notes": "The real run. Each book is pushed to the scratch date, exported to PDF, then deleted before the next. Can take 20\u201340 minutes; raise the node timeout."
+  },
+  {
+   "parameters": {
+    "jsCode": "const raw = $input.first().json.stdout || '';\nlet r;\ntry { r = JSON.parse(raw.trim().split('\\n').pop()); }\ncatch (e) { throw new Error('Build produced no JSON summary. Raw tail:\\n' + raw.slice(-800)); }\n\n/* A PDF with zero call attempts is the signature of the call-log-as-lookup bug:\n   accounts, outstanding and recovered all still look right, so it cannot be caught\n   by eye. Treat it as a failure, never as a pass. */\nconst problems = [];\nif (r.failedCount) problems.push(`${r.failedCount} book(s) failed`);\nif ((r.zeroCallWarning || []).length) problems.push(`zero AI calls: ${r.zeroCallWarning.join(', ')}`);\n\nreturn [{ json: { ...r, problems, healthy: problems.length === 0 } }];"
+   },
+   "id": "verify",
+   "name": "Verify result",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    460,
+    140
+   ]
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "version": 2
+     },
+     "conditions": [
+      {
+       "leftValue": "={{ $json.healthy }}",
+       "rightValue": true,
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    }
+   },
+   "id": "healthy",
+   "name": "All good?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    680,
+    140
+   ]
+  },
+  {
+   "parameters": {
+    "sendTo": "={{ $vars.RBL_NOTIFY_TO }}",
+    "subject": "=RBL reports ready \u2014 {{ $json.built }} book(s)",
+    "message": "={{ $json.built }} report(s) built for scratch date {{ $json.scratchDate }}.\n\nPDFs: {{ $json.outDir }}\n\n{{ $json.reports.map(r => `${r.book} \u2014 ${r.accounts} accounts, ${r.attempts} attempts`).join('\\n') }}\n\nSkipped ({{ $json.skippedCount }}):\n{{ $json.skipped.map(s => `${s.book} \u2014 missing ${s.missing.join(', ')}`).join('\\n') }}",
+    "options": {}
+   },
+   "id": "notify-ok",
+   "name": "Email \u2014 success",
+   "type": "n8n-nodes-base.gmail",
+   "typeVersion": 2.1,
+   "position": [
+    920,
+    40
+   ],
+   "notes": "Swap for SMTP/Slack if you don't use Gmail. Credentials are set in n8n, never in this file."
+  },
+  {
+   "parameters": {
+    "sendTo": "={{ $vars.RBL_NOTIFY_TO }}",
+    "subject": "=RBL reports NEEDS ATTENTION \u2014 {{ $json.problems.join('; ') }}",
+    "message": "=Problems:\n{{ $json.problems.join('\\n') }}\n\nFailures:\n{{ ($json.failures || []).map(f => `${f.book}: ${f.error}`).join('\\n') }}\n\nZero-call books (likely the call log was not rolled up \u2014 do NOT ship these):\n{{ ($json.zeroCallWarning || []).join('\\n') }}\n\nBuilt anyway: {{ $json.built }}\nPDFs: {{ $json.outDir }}",
+    "options": {}
+   },
+   "id": "notify-bad",
+   "name": "Email \u2014 problems",
+   "type": "n8n-nodes-base.gmail",
+   "typeVersion": 2.1,
+   "position": [
+    920,
+    240
+   ]
+  }
+ ],
+ "connections": {
+  "Run manually": {
+   "main": [
+    [
+     {
+      "node": "Plan (dry run)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Monthly (2nd, 07:00) \u2014 disabled": {
+   "main": [
+    [
+     {
+      "node": "Plan (dry run)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Plan (dry run)": {
+   "main": [
+    [
+     {
+      "node": "Parse plan",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse plan": {
+   "main": [
+    [
+     {
+      "node": "Build all reports",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build all reports": {
+   "main": [
+    [
+     {
+      "node": "Verify result",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Verify result": {
+   "main": [
+    [
+     {
+      "node": "All good?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "All good?": {
+   "main": [
+    [
+     {
+      "node": "Email \u2014 success",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Email \u2014 problems",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v1"
+ },
+ "pinData": {}
+}

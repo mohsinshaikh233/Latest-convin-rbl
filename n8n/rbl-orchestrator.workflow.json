@@ -1,0 +1,1531 @@
+{
+ "id": "rbl-orchestrator",
+ "name": "RBL \u00b7 Orchestrator",
+ "nodes": [
+  {
+   "parameters": {},
+   "id": "trg-manual",
+   "name": "Manual run",
+   "type": "n8n-nodes-base.manualTrigger",
+   "typeVersion": 1,
+   "position": [
+    -1520,
+    160
+   ]
+  },
+  {
+   "parameters": {
+    "rule": {
+     "interval": [
+      {
+       "field": "cronExpression",
+       "expression": "0 7 2 * *"
+      }
+     ]
+    }
+   },
+   "id": "trg-schedule",
+   "name": "Monthly (2nd, 07:00)",
+   "type": "n8n-nodes-base.scheduleTrigger",
+   "typeVersion": 1.2,
+   "position": [
+    -1520,
+    320
+   ],
+   "disabled": true,
+   "notes": "SHIPS DISABLED. Enable only after a parallel month \u2014 run the pipeline alongside the manual process and compare every number first (HANDOFF_AUTOMATION.md, \"Run it a month early\")."
+  },
+  {
+   "parameters": {
+    "httpMethod": "POST",
+    "path": "rbl-month",
+    "authentication": "headerAuth",
+    "options": {}
+   },
+   "id": "trg-webhook",
+   "name": "Webhook",
+   "type": "n8n-nodes-base.webhook",
+   "typeVersion": 2,
+   "position": [
+    -1520,
+    480
+   ],
+   "notes": "POST /webhook/rbl-month with {\"month\":\"2026-08\",\"dryRun\":true}. Attach a Header Auth credential in n8n \u2014 this endpoint starts a run that writes to the database."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* One run, one identity.\n\n   runId is what ties a Slack message, a lock file, a state record and an n8n\n   execution to each other. Without it, \"the run that failed\" is a thing a human\n   has to reconstruct from timestamps.\n\n   It is also published into execution.customData, and that is not optional:\n   n8n hands an error workflow the FAILING EXECUTION, not our data, so without\n   this the Error Handler cannot tell which month crashed or prove which run\n   held the lock \u2014 and it then refuses to release that lock, correctly but\n   unhelpfully. Wrapped in try/catch because customData is not available on\n   every n8n build, and a missing convenience must not fail the run. */\n\nconst inp = $input.first().json ?? {};\n\nconst lastMonth = () => {\n  const d = new Date();\n  d.setDate(1);\n  d.setMonth(d.getMonth() - 1);\n  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');\n};\n\n/* Webhook body first (an explicit ask), then the variable (a deliberate\n   re-run of an old month), then last month (the scheduled case). */\nconst body = inp.body ?? inp;\nconst month = String(body.month || $vars.RBL_MONTH || lastMonth()).trim();\nif (!/^[0-9]{4}-[0-9]{2}$/.test(month)) throw new Error('resolved month is not YYYY-MM: ' + JSON.stringify(month));\n\nconst dryRun = body.dryRun === true || body.dryRun === 'true' || $vars.RBL_DRY_RUN === 'true';\nconst runId = new Date().toISOString().replace(/[:.]/g, '-') + '-' + Math.random().toString(36).slice(2, 8);\n\ntry {\n  $execution.customData.set('month', month);\n  $execution.customData.set('runId', runId);\n} catch (e) {\n  // Older n8n, or customData disabled. The Error Handler falls back to\n  // $vars.RBL_MONTH and says which source it used.\n}\n\nconst dryFlag = dryRun ? ' --dry-run' : '';\n\nreturn [{\n  json: {\n    month,\n    dryRun,\n    runId,\n    startedAt: new Date().toISOString(),\n    /* Preflight checks what THIS run will actually run \u2014 not everything the\n       pipeline could ever need. Step 4 adds 03,04 here when the Cohort Loop\n       lands. --run-id lets stage 00 recognise the lock we are about to take as\n       our own instead of stopping on it. */\n    preflightArgs: '--stages 01,02,03,04,05,06,07,08 --run-id ' + runId + dryFlag,\n    stageArgs: dryFlag.trim(),\n    lockCommand: null, // filled by the next node\n  },\n}];"
+   },
+   "id": "resolve",
+   "name": "Resolve month",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -1300,
+    320
+   ],
+   "notes": "month = webhook body \u2192 $vars.RBL_MONTH \u2192 last month. Mints the runId and publishes month/runId into execution.customData for the Error Handler."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Build the quoted lock command. Same discipline as the Stage Runner: the\n   only place a value reaches a shell is a Code node that quotes every token. */\nconst inp = $input.first().json ?? {};\nconst r = $('Resolve month').first().json;\nconst q = (s) => \"'\" + String(s).replace(/'/g, \"'\\\\''\") + \"'\";\nconst repo = $vars.RBL_REPO;\nif (!repo) throw new Error('n8n variable RBL_REPO is not set \u2014 see n8n/SETUP_MONTH_PIPELINE.md');\n\nconst command = 'cd ' + q(repo)\n  + ' && npm run pipeline --silent -- --stage lock --month ' + q(r.month)\n  + ' --acquire --run-id ' + q(r.runId)\n  + ' --json';\n\n/* Spread the INCOMING item, not just Resolve month: on the release path this\n   carries the severity, title and body that Notify is about to send. */\nreturn [{ json: { ...inp, month: r.month, runId: r.runId, dryRun: r.dryRun, startedAt: r.startedAt, command } }];"
+   },
+   "id": "lock-cmd",
+   "name": "Build the lock command",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -1080,
+    320
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=( {{ $json.command }} ); printf '__EXIT__%s\\n' \"$?\""
+   },
+   "id": "lock-acquire",
+   "name": "Acquire the month lock",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    -860,
+    320
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "One of only two Execute Command nodes allowed here (\u00a73.2). Exit 10 = another run holds it. The command is wrapped so the shell always exits 0 and the real code travels in stdout as __EXIT__<code>. Measured on n8n 2.35.7: this node reports exitCode ONLY when the command exits 0 \u2014 on any non-zero exit it emits { error } alone, dropping both exitCode and stdout, with the stderr text as the message. That makes an exit 10 (a human must decide) indistinguishable from a crash, and loses the JSON line the contract is built on. onError:continueRegularOutput keeps the workflow running but does not restore the fields."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Did we get the lock? Exit 10 means someone else holds a live one \u2014 that is\n   a stop, not a failure: two runs on one month interleave writes to\n   state/<month>.json and a later re-run then skips work that never happened. */\nconst out = $('Acquire the month lock').first().json;\nconst r = $('Resolve month').first().json;\n\n/* THE SENTINEL IS THE ONLY RELIABLE EXIT CODE. Measured on n8n 2.35.7: the\n   Execute Command node reports `exitCode` only when the command exits 0. On any\n   non-zero exit it emits `{ error }` alone \u2014 no exitCode, no stdout \u2014 so a\n   lock.mjs exit 10 (\"someone else holds this month\", a decision) is\n   indistinguishable from a crash. The command is wrapped to always exit 0 and\n   print __EXIT__<code> on stdout. */\nconst stdoutRaw = String(out.stdout ?? '');\nconst sentinelMatch = [...stdoutRaw.matchAll(/^__EXIT__(\\d+)\\s*$/gm)].pop();\nconst exitCode = sentinelMatch ? Number(sentinelMatch[1])\n  : (Number.isFinite(Number(out.exitCode)) ? Number(out.exitCode) : (out.error ? 1 : 0));\nconst stdout = stdoutRaw.replace(/^__EXIT__\\d+\\s*$/gm, '');\nconst line = stdout.split('\\n').map((l) => l.trim()).filter((l) => l.startsWith('{')).pop();\nlet res = null;\ntry { res = line ? JSON.parse(line) : null; } catch (e) { res = null; }\n\nconst acquired = exitCode === 0 && res?.acquired === true;\n\nreturn [{\n  json: {\n    ...r,\n    acquired,\n    exitCode,\n    lock: res?.lock ?? null,\n    /* Taking a stale lock is legitimate but must be visible: it means a\n       previous run died without releasing, and that is worth a line in the\n       run report rather than silence. */\n    tookStale: !!res?.tookFrom,\n    lockReason: res?.reason ?? null,\n    holder: res?.holder ?? null,\n  },\n}];"
+   },
+   "id": "lock-read",
+   "name": "Read the lock result",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -640,
+    320
+   ]
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "got-lock",
+       "leftValue": "={{ $json.acquired }}",
+       "rightValue": true,
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "if-lock",
+   "name": "Lock acquired?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    -420,
+    320
+   ],
+   "notes": "False means another run has this month. That path notifies WITHOUT releasing \u2014 the lock is not ours to release."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Another run holds this month. Do NOT release it \u2014 it is not ours, and\n   lock.mjs would refuse anyway. Report and stop. */\nconst j = $input.first().json;\nreturn [{\n  json: {\n    ...j,\n    severity: 'stop',\n    stage: 'lock',\n    title: 'another run holds ' + j.month,\n    body: (j.lockReason || 'the month lock is held') + '\\n\\nThis run did nothing. Wait for the other run, or clear the lock:\\n' +\n      '  npm run pipeline -- --stage lock --month ' + j.month + ' --status',\n    releaseLock: false,\n  },\n}];"
+   },
+   "id": "locked-out",
+   "name": "Another run has it",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -420,
+    640
+   ]
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-stage-runner",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Stage Runner"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "stage": "00",
+      "month": "={{ $('Resolve month').first().json.month }}",
+      "args": "={{ $('Resolve month').first().json.preflightArgs }}",
+      "label": "Preflight"
+     }
+    },
+    "options": {}
+   },
+   "id": "stage-00",
+   "name": "00 \u00b7 Preflight",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    -200,
+    320
+   ],
+   "notes": "Runs stage 00 through RBL \u00b7 Stage Runner and returns the envelope. No Execute Command here \u2014 the orchestrator owns no shell but lock/unlock."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "is-done",
+       "leftValue": "={{ $json.outcome }}",
+       "rightValue": "done",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "if-00-ok-",
+   "name": "00 ok?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    -90,
+    320
+   ],
+   "notes": "done \u2192 next stage. stop or crash \u2192 halt, release the lock, notify."
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-stage-runner",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Stage Runner"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "stage": "01",
+      "month": "={{ $('Resolve month').first().json.month }}",
+      "args": "={{ $('Resolve month').first().json.stageArgs }}",
+      "label": "Fetch from S3"
+     }
+    },
+    "options": {}
+   },
+   "id": "stage-01",
+   "name": "01 \u00b7 Fetch from S3",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    20,
+    320
+   ],
+   "notes": "Runs stage 01 through RBL \u00b7 Stage Runner and returns the envelope. No Execute Command here \u2014 the orchestrator owns no shell but lock/unlock."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "is-done",
+       "leftValue": "={{ $json.outcome }}",
+       "rightValue": "done",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "if-01-ok-",
+   "name": "01 ok?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    130,
+    320
+   ],
+   "notes": "done \u2192 next stage. stop or crash \u2192 halt, release the lock, notify."
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-stage-runner",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Stage Runner"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "stage": "02",
+      "month": "={{ $('Resolve month').first().json.month }}",
+      "args": "={{ $('Resolve month').first().json.stageArgs }}",
+      "label": "Plan + campaign assignment"
+     }
+    },
+    "options": {}
+   },
+   "id": "stage-02",
+   "name": "02 \u00b7 Plan + campaign assignment",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    240,
+    320
+   ],
+   "notes": "Runs stage 02 through RBL \u00b7 Stage Runner and returns the envelope. No Execute Command here \u2014 the orchestrator owns no shell but lock/unlock."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "is-done",
+       "leftValue": "={{ $json.outcome }}",
+       "rightValue": "done",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "if-02-ok-",
+   "name": "02 ok?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    350,
+    320
+   ],
+   "notes": "done \u2192 next stage. stop or crash \u2192 halt, release the lock, notify."
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-stage-runner",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Stage Runner"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "stage": "05",
+      "month": "={{ $('Resolve month').first().json.month }}",
+      "args": "={{ $('Resolve month').first().json.stageArgs }}",
+      "label": "Assemble the day-folder tree"
+     }
+    },
+    "options": {}
+   },
+   "id": "stage-05",
+   "name": "05 \u00b7 Assemble the day-folder tree",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    460,
+    320
+   ],
+   "notes": "Runs stage 05 through RBL \u00b7 Stage Runner and returns the envelope. No Execute Command here \u2014 the orchestrator owns no shell but lock/unlock."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "is-done",
+       "leftValue": "={{ $json.outcome }}",
+       "rightValue": "done",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "if-05-ok-",
+   "name": "05 ok?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    570,
+    320
+   ],
+   "notes": "done \u2192 next stage. stop or crash \u2192 halt, release the lock, notify."
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-stage-runner",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Stage Runner"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "stage": "06",
+      "month": "={{ $('Resolve month').first().json.month }}",
+      "args": "={{ $('Resolve month').first().json.stageArgs }}",
+      "label": "Build the PDFs"
+     }
+    },
+    "options": {}
+   },
+   "id": "stage-06",
+   "name": "06 \u00b7 Build the PDFs",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    680,
+    320
+   ],
+   "notes": "Runs stage 06 through RBL \u00b7 Stage Runner and returns the envelope. No Execute Command here \u2014 the orchestrator owns no shell but lock/unlock."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "is-done",
+       "leftValue": "={{ $json.outcome }}",
+       "rightValue": "done",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "if-06-ok-",
+   "name": "06 ok?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    790,
+    320
+   ],
+   "notes": "done \u2192 next stage. stop or crash \u2192 halt, release the lock, notify."
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-stage-runner",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Stage Runner"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "stage": "07",
+      "month": "={{ $('Resolve month').first().json.month }}",
+      "args": "={{ $('Resolve month').first().json.stageArgs }}",
+      "label": "Verify"
+     }
+    },
+    "options": {}
+   },
+   "id": "stage-07",
+   "name": "07 \u00b7 Verify",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    900,
+    320
+   ],
+   "notes": "Runs stage 07 through RBL \u00b7 Stage Runner and returns the envelope. No Execute Command here \u2014 the orchestrator owns no shell but lock/unlock."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "is-done",
+       "leftValue": "={{ $json.outcome }}",
+       "rightValue": "done",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "if-07-ok-",
+   "name": "07 ok?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    1010,
+    320
+   ],
+   "notes": "done \u2192 next stage. stop or crash \u2192 halt, release the lock, notify."
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-cohort-loop",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Cohort Loop"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "month": "={{ $('Resolve month').first().json.month }}",
+      "dryRun": "={{ $('Resolve month').first().json.dryRun }}",
+      "runId": "={{ $('Resolve month').first().json.runId }}"
+     }
+    },
+    "options": {}
+   },
+   "id": "cohorts",
+   "name": "Cohorts (03 + 04)",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    460,
+    320
+   ],
+   "notes": "Fans out one row per uncollected cohort, retries a crash 3 times with 5/10/20-minute backoff, escalates and continues. Returns monthIncomplete."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "complete",
+       "leftValue": "={{ $json.monthIncomplete }}",
+       "rightValue": true,
+       "operator": {
+        "type": "boolean",
+        "operation": "false",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "if-cohorts",
+   "name": "All cohorts collected?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    570,
+    320
+   ],
+   "notes": "False \u2192 skip stages 05-07 entirely. A month missing a cohort must not be built."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* \u00a73.4 step 6: one or more cohorts did not collect, so the month is INCOMPLETE\n   and stages 05-07 must not run on it. Building a report where a cohort's calls\n   never arrived produces books whose AI figures are silently short \u2014 accounts,\n   outstanding and recovered all still render correctly, and only the thing the\n   client is paying to see is wrong.\n\n   AMBER, not red. Each individual cohort failure was already escalated by the\n   Cohort Loop with its own severity (a crash red, a question amber). This\n   message is the pipeline REFUSING TO BUILD, which is it working. */\nconst r = $('Resolve month').first().json;\nconst s = $input.first().json;\n\nconst body = [\n  s.reason,\n  '',\n  ...(s.failed || []).map((f) => '  ' + f.key + ' \u2014 ' + f.outcome + ' after ' + f.attempts + ' attempt(s): ' + String(f.reason).slice(0, 200)),\n  '',\n  'Collected ' + s.collected + ' of ' + s.attempted + ' attempted (' + s.alreadyCollected + ' were already done).',\n  '',\n  'Stages 05-07 have been skipped deliberately. Resolve the cohorts above and run',\n  'the workflow again \u2014 everything already collected is skipped on the re-run.',\n].join('\\n');\n\nreturn [{\n  json: {\n    ...r,\n    severity: 'stop',\n    stage: '03/04',\n    title: 'month incomplete \u2014 ' + (s.failed || []).length + ' cohort(s) unresolved',\n    body,\n    releaseLock: true,\n  },\n}];"
+   },
+   "id": "cohorts-incomplete",
+   "name": "Cohorts incomplete",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    570,
+    620
+   ]
+  },
+  {
+   "parameters": {
+    "jsCode": "/* One stage did not finish. Decide what kind of event that is \u2014 and the\n   distinction is the whole point of the exit-code contract:\n\n     outcome \"stop\"  \u2192 exit 10 \u2192 the pipeline REFUSED TO GUESS. Amber. Not a\n                       failure, and nothing before it has to be repeated.\n     outcome \"crash\" \u2192 anything else \u2192 red.\n\n   Nothing here decides what the data means; it reads the envelope the Stage\n   Runner already classified and routes on it. */\n\nconst env = $input.first().json;\nconst r = $('Resolve month').first().json;\n\nconst isStop = env.outcome === 'stop';\nconst stageJson = env.json ?? {};\nconst reason = stageJson.reason || env.contractViolation || env.stderrTail || 'no reason reported';\n\nconst body = [\n  (isStop ? 'Stopped at' : 'Crashed at') + ' stage ' + env.stage + ' (' + (env.label || '') + ') after ' + Math.round((env.durationMs || 0) / 1000) + 's.',\n  '',\n  reason,\n  '',\n  isStop\n    ? 'Nothing before this stage has to be repeated \u2014 every stage is idempotent and\\nconsults state/' + r.month + '.json. Resolve the question and run the workflow again.'\n    : 'Re-running is safe: completed work will not repeat.',\n  env.contractViolation ? '\\nCONTRACT VIOLATION: ' + env.contractViolation : '',\n].filter(Boolean).join('\\n');\n\nreturn [{\n  json: {\n    ...r,\n    severity: isStop ? 'stop' : 'fail',\n    stage: env.stage,\n    title: (isStop ? 'awaiting a decision at stage ' : 'stage ') + env.stage + (isStop ? '' : ' failed'),\n    body,\n    outcome: env.outcome,\n    exitCode: env.exitCode,\n    releaseLock: true,\n  },\n}];"
+   },
+   "id": "halt",
+   "name": "Explain the halt",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1120,
+    460
+   ],
+   "notes": "stop \u2192 amber \"awaiting a decision\". crash \u2192 red. The distinction is preserved end to end: exit code, branch, colour, wording."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Build the quoted lock command. Same discipline as the Stage Runner: the\n   only place a value reaches a shell is a Code node that quotes every token. */\nconst inp = $input.first().json ?? {};\nconst r = $('Resolve month').first().json;\nconst q = (s) => \"'\" + String(s).replace(/'/g, \"'\\\\''\") + \"'\";\nconst repo = $vars.RBL_REPO;\nif (!repo) throw new Error('n8n variable RBL_REPO is not set \u2014 see n8n/SETUP_MONTH_PIPELINE.md');\n\nconst command = 'cd ' + q(repo)\n  + ' && npm run pipeline --silent -- --stage lock --month ' + q(r.month)\n  + ' --release --run-id ' + q(r.runId)\n  + ' --json';\n\n/* Spread the INCOMING item, not just Resolve month: on the release path this\n   carries the severity, title and body that Notify is about to send. */\nreturn [{ json: { ...inp, month: r.month, runId: r.runId, dryRun: r.dryRun, startedAt: r.startedAt, command } }];"
+   },
+   "id": "release-cmd",
+   "name": "Build the release command",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1340,
+    320
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=( {{ $json.command }} ); printf '__EXIT__%s\\n' \"$?\""
+   },
+   "id": "release",
+   "name": "Release the lock",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    1560,
+    320
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "Runs on EVERY exit path that took the lock \u2014 success and halt alike (\u00a73.2 step 13). A crash path is covered by RBL \u00b7 Error Handler, which releases it too. The command is wrapped so the shell always exits 0 and the real code travels in stdout as __EXIT__<code>. Measured on n8n 2.35.7: this node reports exitCode ONLY when the command exits 0 \u2014 on any non-zero exit it emits { error } alone, dropping both exitCode and stdout, with the stderr text as the message. That makes an exit 10 (a human must decide) indistinguishable from a crash, and loses the JSON line the contract is built on. onError:continueRegularOutput keeps the workflow running but does not restore the fields."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Did the lock come off? A held lock wedges the next scheduled run, and the\n   failure surfaces a month later pointing at a process that died in October. */\nconst prev = $('Build the release command').first().json;\nconst out = $('Release the lock').first().json;\n\n/* THE SENTINEL IS THE ONLY RELIABLE EXIT CODE. Measured on n8n 2.35.7: the\n   Execute Command node reports `exitCode` only when the command exits 0. On any\n   non-zero exit it emits `{ error }` alone \u2014 no exitCode, no stdout \u2014 so a\n   lock.mjs exit 10 (\"someone else holds this month\", a decision) is\n   indistinguishable from a crash. The command is wrapped to always exit 0 and\n   print __EXIT__<code> on stdout. */\nconst stdoutRaw = String(out.stdout ?? '');\nconst sentinelMatch = [...stdoutRaw.matchAll(/^__EXIT__(\\d+)\\s*$/gm)].pop();\nconst exitCode = sentinelMatch ? Number(sentinelMatch[1])\n  : (Number.isFinite(Number(out.exitCode)) ? Number(out.exitCode) : (out.error ? 1 : 0));\nconst stdout = stdoutRaw.replace(/^__EXIT__\\d+\\s*$/gm, '');\nconst line = stdout.split('\\n').map((l) => l.trim()).filter((l) => l.startsWith('{')).pop();\nlet res = null;\ntry { res = line ? JSON.parse(line) : null; } catch (e) { res = null; }\n\nconst released = res?.released === true || (res?.released === false && /no lock was held/i.test(res?.reason ?? ''));\n\nreturn [{\n  json: {\n    ...prev,\n    body: prev.body + (released ? '' : '\\n\\nMONTH LOCK NOT RELEASED \u2014 ' + (res?.reason ?? 'no parseable result') +\n      '\\nClear it with: npm run pipeline -- --stage lock --month ' + prev.month + ' --status'),\n    lockReleased: released,\n  },\n}];"
+   },
+   "id": "release-read",
+   "name": "Read the release",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1780,
+    320
+   ]
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-notify",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Notify"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "severity": "={{ $json.severity }}",
+      "runId": "={{ $json.runId }}",
+      "month": "={{ $json.month }}",
+      "stage": "={{ $json.stage }}",
+      "title": "={{ $json.title }}",
+      "body": "={{ $json.body }}",
+      "resumeUrl": "",
+      "executionUrl": "",
+      "attachments": "={{ $json.attachments || \"\" }}"
+     }
+    },
+    "options": {}
+   },
+   "id": "notify",
+   "name": "Notify",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    2000,
+    320
+   ]
+  },
+  {
+   "parameters": {
+    "content": "## Stages 03 + 04 run inside `RBL \u00b7 Cohort Loop`\n\nOne row per uncollected cohort, so a stall is visible **while it is happening** rather than after two hours of silence.\n\nRetry lives there, not here: a crash gets 3 attempts at 5 / 10 / 20 minutes; a stop escalates immediately in amber. A cohort that never collects is marked **failed** in state \u2014 never read downstream as \"no calls\".\n\nIf any cohort fails, `monthIncomplete` comes back true and **stages 05-07 are skipped**.",
+    "height": 320,
+    "width": 420,
+    "color": 4
+   },
+   "id": "note-cohort",
+   "name": "Where the cohort loop goes",
+   "type": "n8n-nodes-base.stickyNote",
+   "typeVersion": 1,
+   "position": [
+    180,
+    -140
+   ]
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "is-stop",
+       "leftValue": "={{ $json.outcome }}",
+       "rightValue": "stop",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "if-stopcrash",
+   "name": "Stop or crash?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    1020,
+    760
+   ],
+   "notes": "A stop is a question for a human \u2014 it gets a form. A crash is a fault \u2014 it halts."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Turn a stage's stop payload into a form the operator can answer.\n\n   THE INFERENCE IS SHOWN BUT NEVER PRE-FILLED. plan_month's campaign guess is\n   right most of the time, and \"most of the time\" is exactly the failure this\n   stop exists to prevent: CYC 18 PDD+7 and CYC 20 PDD+5 are real August Bucket\n   books that the inference calls PreX (PIPELINE_BUILD_RESULT.md finding #1). A\n   form that arrives pre-filled with the guess can be accepted with one click by\n   someone who never read it, which is the same thing as not asking. So the\n   campaign field starts EMPTY, with the inference printed beside it, and\n   --apply-assignments refuses an entry that does not name one. */\n\nconst env = $input.first().json;\nconst r = $('Resolve month').first().json;\nconst j = env.json ?? {};\nconst isPlan = env.stage === '02';\n\nconst rows = isPlan\n  ? (j.unassigned ?? []).map((u) => ({\n      book: u.book,\n      loadDate: u.loadDate,\n      _inference: u.inference ?? null,\n      _why: u.reason,\n      campaign: '',\n      days: u.needs === 'days' ? '' : undefined,\n    }))\n  : (j.unresolvedGaps ?? j.gaps ?? []).map((g) => ({\n      book: g.book,\n      _gap: g.reason + (g.dates ? ' \u2014 missing ' + g.dates.join(', ') : ''),\n      ruling: '',\n      reason: '',\n    }));\n\nconst heading = isPlan\n  ? 'Campaign assignment \u2014 ' + rows.length + ' book(s) need a decision'\n  : 'Gap rulings \u2014 ' + rows.length + ' book(s) could not be fully assembled';\n\nconst guidance = isPlan\n  ? [\n      'For each book set \"campaign\" to prex or bucket. \"_inference\" is what',\n      'plan_month guessed from the name \u2014 it is shown, not applied, because it',\n      'is wrong for real books: CYC 18 PDD+7 and CYC 20 PDD+5 are Bucket books',\n      'it calls PreX. Set \"days\" only where the field is present and empty.',\n      '',\n      'Campaign decides which status file a book is paired with, and the two',\n      'campaigns use different outcome vocabularies. Pair a book with the wrong',\n      'one and every number on the report renders, and every number is wrong.',\n    ].join('\\n')\n  : [\n      'For each book set \"ruling\" to one of:',\n      '  build-partial  build the days that exist, knowing the report is short',\n      '  wait-for-file  the file is still coming \u2014 this keeps the run blocked',\n      '  exclude-book   this book is not part of this month\\'s reporting',\n      '',\n      'A \"reason\" is required on every row. State answers which books were',\n      'partial; only you can answer why one shipped that way.',\n    ].join('\\n');\n\nreturn [{\n  json: {\n    ...r,\n    stage: env.stage,\n    formHeading: heading,\n    formGuidance: guidance,\n    prefill: JSON.stringify(rows, null, 2),\n    rowCount: rows.length,\n    severity: 'stop',\n    title: isPlan ? 'campaign assignment needed' : 'gap rulings needed',\n    body: heading + '\\n\\n' + (isPlan\n      ? rows.map((x) => '  ' + x.book + '  loaded ' + x.loadDate + '  (inference: ' + (x._inference ?? 'none') + ')').join('\\n')\n      : rows.map((x) => '  ' + x.book + '  ' + x._gap).join('\\n')),\n  },\n}];\n"
+   },
+   "id": "ask",
+   "name": "Build the question",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1240,
+    760
+   ],
+   "notes": "Renders the stop payload into form rows. The campaign inference is SHOWN but never pre-filled \u2014 a form that can be accepted with one click is the same as not asking."
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-notify",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Notify"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "severity": "stop",
+      "runId": "={{ $json.runId }}",
+      "month": "={{ $json.month }}",
+      "stage": "={{ $json.stage }}",
+      "title": "={{ $json.title }}",
+      "body": "={{ $json.body }}",
+      "resumeUrl": "={{ $execution.resumeUrl }}",
+      "executionUrl": "",
+      "attachments": ""
+     }
+    },
+    "options": {}
+   },
+   "id": "ask-notify",
+   "name": "Ask (amber, with the resume link)",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    1460,
+    760
+   ],
+   "notes": "Carries $execution.resumeUrl \u2014 the difference between \"a decision is needed\" and \"someone must go and find where to make it\"."
+  },
+  {
+   "parameters": {
+    "resume": "form",
+    "formTitle": "={{ $('Build the question').first().json.formHeading }}",
+    "formDescription": "={{ $('Build the question').first().json.formGuidance }}",
+    "formFields": {
+     "values": [
+      {
+       "fieldLabel": "Your answers",
+       "fieldType": "textarea",
+       "requiredField": true,
+       "placeholder": "={{ $('Build the question').first().json.prefill }}"
+      },
+      {
+       "fieldLabel": "Your name",
+       "fieldType": "text",
+       "requiredField": true
+      }
+     ]
+    },
+    "options": {
+     "limitWaitTime": true,
+     "resumeAmount": 48,
+     "resumeUnit": "hours"
+    }
+   },
+   "id": "wait-form",
+   "name": "Wait for the decision",
+   "type": "n8n-nodes-base.wait",
+   "typeVersion": 1.1,
+   "position": [
+    1680,
+    760
+   ],
+   "webhookId": "rbl-decision-form",
+   "notes": "48-hour deadline with a defined timeout path. An execution waiting forever is how a queue silently fills."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "loose",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "answered",
+       "leftValue": "={{ $json['Your answers'] }}",
+       "rightValue": "",
+       "operator": {
+        "type": "string",
+        "operation": "notEmpty",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "if-answered",
+   "name": "Answered in time?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    1900,
+    760
+   ]
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Build the command that records the answer and re-runs the stage.\n\n   THE REPO IS THE AUDIT RECORD, NOT N8N (\u00a73.3). n8n's execution data is pruned,\n   is not diffable, and is not where anyone looks in six months.\n   --apply-assignments writes state/campaigns.json and --apply-rulings writes\n   state/<month>.json, both with decidedBy and decidedAt, and both re-run their\n   stage in the same invocation so the operator sees the result their answer\n   produced. */\n\nconst ask = $('Build the question').first().json;\nconst form = $input.first().json;\n\nconst q = (s) => \"'\" + String(s).replace(/'/g, \"'\\\\''\") + \"'\";\nconst repo = $vars.RBL_REPO;\nif (!repo) throw new Error('n8n variable RBL_REPO is not set \u2014 see n8n/SETUP_MONTH_PIPELINE.md');\n\n/* The form returns the edited JSON as a string. Parse it here so a malformed\n   answer fails with a clear message rather than reaching a shell. */\nconst raw = form['Your answers'] ?? form.answers ?? '';\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch (e) {\n  throw new Error('the submitted answer is not valid JSON (' + e.message + '). Nothing was applied; re-run the workflow to be asked again.');\n}\nif (!Array.isArray(parsed) || !parsed.length) throw new Error('the submitted answer must be a non-empty JSON array.');\n\nconst decidedBy = String(form['Your name'] ?? '').trim() || 'n8n-form';\nconst flag = ask.stage === '02' ? '--apply-assignments' : '--apply-rulings';\n\nconst command = 'cd ' + q(repo)\n  + ' && npm run pipeline --silent -- --stage ' + q(ask.stage)\n  + ' --month ' + q(ask.month)\n  + ' ' + flag + ' ' + q(JSON.stringify(parsed))\n  + ' --decided-by ' + q(decidedBy)\n  + ' --run-id ' + q(ask.runId)\n  + ' --json';\n\nreturn [{ json: { ...ask, decidedBy, answerCount: parsed.length, command } }];\n"
+   },
+   "id": "apply-cmd",
+   "name": "Build the apply command",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2120,
+    700
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=( {{ $json.command }} ); printf '__EXIT__%s\\n' \"$?\""
+   },
+   "id": "apply",
+   "name": "Record the decision",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    2340,
+    700
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "Writes the answer with decidedBy/decidedAt into state/ AND re-runs the stage in the same invocation. The repo is the audit record, not n8n. The command is wrapped so the shell always exits 0 and the real code travels in stdout as __EXIT__<code>. Measured on n8n 2.35.7: this node reports exitCode ONLY when the command exits 0 \u2014 on any non-zero exit it emits { error } alone, dropping both exitCode and stdout, with the stderr text as the message. That makes an exit 10 (a human must decide) indistinguishable from a crash, and loses the JSON line the contract is built on. onError:continueRegularOutput keeps the workflow running but does not restore the fields."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Did the answer stick? A rejected form (unknown book name, missing reason) is\n   an operator error, not a new decision point \u2014 it comes back RED so it cannot\n   be mistaken for the pipeline asking the same question again. */\nconst meta = $('Build the apply command').first().json;\nconst out = $('Record the decision').first().json;\n\n/* THE SENTINEL IS THE ONLY RELIABLE EXIT CODE. Measured on n8n 2.35.7: the\n   Execute Command node reports `exitCode` only when the command exits 0. On any\n   non-zero exit it emits `{ error }` alone \u2014 no exitCode, no stdout \u2014 so a\n   lock.mjs exit 10 (\"someone else holds this month\", a decision) is\n   indistinguishable from a crash. The command is wrapped to always exit 0 and\n   print __EXIT__<code> on stdout. */\nconst stdoutRaw = String(out.stdout ?? '');\nconst sentinelMatch = [...stdoutRaw.matchAll(/^__EXIT__(\\d+)\\s*$/gm)].pop();\nconst exitCode = sentinelMatch ? Number(sentinelMatch[1])\n  : (Number.isFinite(Number(out.exitCode)) ? Number(out.exitCode) : (out.error ? 1 : 0));\nconst stdout = stdoutRaw.replace(/^__EXIT__\\d+\\s*$/gm, '');\nconst line = stdout.split('\\n').map((l) => l.trim()).filter((l) => l.startsWith('{')).pop();\nlet res = null;\ntry { res = line ? JSON.parse(line) : null; } catch (e) { res = null; }\n\nconst accepted = exitCode === 0 && res?.ok === true;\nconst rejected = res?.rejected ?? [];\n\nreturn [{\n  json: {\n    ...meta,\n    accepted,\n    exitCode,\n    result: res,\n    severity: accepted ? 'info' : 'fail',\n    title: accepted ? 'decision applied \u2014 stage ' + meta.stage + ' re-ran' : 'decision REJECTED at stage ' + meta.stage,\n    body: accepted\n      ? meta.answerCount + ' answer(s) recorded by ' + meta.decidedBy + ' and stage ' + meta.stage + ' re-ran successfully.\\n\\n' +\n        (res?.reason ?? '') + '\\n\\nThe decision is in the repo (state/), not in n8n.'\n      : 'The submitted answers were refused and NOTHING was written:\\n\\n' +\n        rejected.map((x) => '  ' + (x.book ?? JSON.stringify(x.entry)) + ' \u2014 ' + x.why).join('\\n') +\n        '\\n\\n' + (res?.reason ?? ('exit ' + exitCode)) +\n        '\\n\\nRe-run the workflow to be asked again.',\n    releaseLock: true,\n  },\n}];\n"
+   },
+   "id": "apply-read",
+   "name": "Was it accepted?",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2560,
+    700
+   ]
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Nobody answered. An execution waiting forever is how a queue silently fills,\n   so the wait has a deadline \u2014 and the deadline releases the lock, because a\n   month held by an unanswered question blocks every later run of it. */\nconst ask = $('Build the question').first().json;\nreturn [{\n  json: {\n    ...ask,\n    severity: 'stop',\n    title: 'no answer after 48h \u2014 ' + ask.month + ' released',\n    body: ask.formHeading + '\\n\\nNobody answered within 48 hours, so the run ended and the month lock was\\n' +\n      'released. Nothing was decided and nothing was built. Re-run the workflow when\\n' +\n      'someone can answer \u2014 every stage before this one is idempotent and will be skipped.',\n    releaseLock: true,\n  },\n}];\n"
+   },
+   "id": "timed-out",
+   "name": "Nobody answered",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2120,
+    900
+   ]
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-stage-runner",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Stage Runner"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "stage": "08",
+      "month": "={{ $('Resolve month').first().json.month }}",
+      "args": "={{ $('Resolve month').first().json.stageArgs }}",
+      "label": "Client portfolios"
+     }
+    },
+    "options": {}
+   },
+   "id": "stage-08",
+   "name": "08 \u00b7 Client portfolios",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    1240,
+    200
+   ],
+   "notes": "Refuses to run unless stage 07 passed \u2014 a client-facing document built on unverified numbers is the worst output this system can produce."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "ok08",
+       "leftValue": "={{ $json.outcome }}",
+       "rightValue": "done",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "if-08",
+   "name": "08 ok?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    1350,
+    200
+   ]
+  },
+  {
+   "parameters": {
+    "jsCode": "/* The month is verified and the client documents exist. This is the only\n   notification that carries files.\n\n   The per-book PDFs are NOT uploaded anywhere yet: S3_PREFIX_OUTPUT is not\n   configured and stage 01's S3 path has never run against a real bucket, so an\n   upload here would be a second unproven network leg on the one path that\n   reaches the client. Their locations are listed instead, and the operator\n   sends them the way they always have. */\nconst r = $('Resolve month').first().json;\nconst client = $input.first().json;\nconst j = client.json ?? {};\nconst docs = j.documents ?? [];\n\nconst built = $('06 \u00b7 Build the PDFs').first().json.json ?? {};\nconst perBook = built.reports ?? [];\n\nconst attachments = docs.map((d) => d.pdf).filter(Boolean).join(',');\n\nconst body = [\n  'The ' + r.month + ' run is complete and verified.',\n  '',\n  ...docs.map((d) => '  ' + d.label + ' Portfolio \u2014 ' + d.books + ' book(s), ' +\n    Number(d.accounts).toLocaleString('en-IN') + ' accounts, ' +\n    Number(d.attempts).toLocaleString('en-IN') + ' AI attempts'),\n  '',\n  docs.length ? 'Client portfolios attached.' : 'No client portfolios were produced.',\n  '',\n  perBook.length + ' per-book report(s) are in:',\n  '  ' + (built.outDir ?? '(unknown)'),\n  '',\n  'They are not uploaded anywhere \u2014 S3_PREFIX_OUTPUT is not configured, and the',\n  'S3 path has never run against a real bucket. Send them as you always have.',\n  '',\n  r.dryRun ? 'THIS WAS A DRY RUN \u2014 the documents are in a temp directory and nothing was delivered.' : '',\n].filter(Boolean).join('\\n');\n\nreturn [{\n  json: {\n    ...r,\n    severity: 'info',\n    stage: '08',\n    title: r.dryRun ? 'dry run complete' : 'month complete \u2014 portfolios attached',\n    body,\n    attachments: r.dryRun ? '' : attachments,\n    documents: docs,\n    releaseLock: true,\n  },\n}];"
+   },
+   "id": "deliver",
+   "name": "Deliver",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1500,
+    200
+   ],
+   "notes": "Builds the delivery message and names the client PDFs as attachments. The only notification that carries files."
+  }
+ ],
+ "connections": {
+  "Manual run": {
+   "main": [
+    [
+     {
+      "node": "Resolve month",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Monthly (2nd, 07:00)": {
+   "main": [
+    [
+     {
+      "node": "Resolve month",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Webhook": {
+   "main": [
+    [
+     {
+      "node": "Resolve month",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Resolve month": {
+   "main": [
+    [
+     {
+      "node": "Build the lock command",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build the lock command": {
+   "main": [
+    [
+     {
+      "node": "Acquire the month lock",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Acquire the month lock": {
+   "main": [
+    [
+     {
+      "node": "Read the lock result",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Read the lock result": {
+   "main": [
+    [
+     {
+      "node": "Lock acquired?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Lock acquired?": {
+   "main": [
+    [
+     {
+      "node": "00 \u00b7 Preflight",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Another run has it",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Another run has it": {
+   "main": [
+    [
+     {
+      "node": "Notify",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Explain the halt": {
+   "main": [
+    [
+     {
+      "node": "Build the release command",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build the release command": {
+   "main": [
+    [
+     {
+      "node": "Release the lock",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Release the lock": {
+   "main": [
+    [
+     {
+      "node": "Read the release",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Read the release": {
+   "main": [
+    [
+     {
+      "node": "Notify",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "00 \u00b7 Preflight": {
+   "main": [
+    [
+     {
+      "node": "00 ok?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "00 ok?": {
+   "main": [
+    [
+     {
+      "node": "01 \u00b7 Fetch from S3",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Explain the halt",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "01 \u00b7 Fetch from S3": {
+   "main": [
+    [
+     {
+      "node": "01 ok?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "01 ok?": {
+   "main": [
+    [
+     {
+      "node": "02 \u00b7 Plan + campaign assignment",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Explain the halt",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "02 \u00b7 Plan + campaign assignment": {
+   "main": [
+    [
+     {
+      "node": "02 ok?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "02 ok?": {
+   "main": [
+    [
+     {
+      "node": "Cohorts (03 + 04)",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Stop or crash?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "05 \u00b7 Assemble the day-folder tree": {
+   "main": [
+    [
+     {
+      "node": "05 ok?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "05 ok?": {
+   "main": [
+    [
+     {
+      "node": "06 \u00b7 Build the PDFs",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Stop or crash?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "06 \u00b7 Build the PDFs": {
+   "main": [
+    [
+     {
+      "node": "06 ok?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "06 ok?": {
+   "main": [
+    [
+     {
+      "node": "07 \u00b7 Verify",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Explain the halt",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "07 \u00b7 Verify": {
+   "main": [
+    [
+     {
+      "node": "07 ok?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "07 ok?": {
+   "main": [
+    [
+     {
+      "node": "08 \u00b7 Client portfolios",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Explain the halt",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Cohorts (03 + 04)": {
+   "main": [
+    [
+     {
+      "node": "All cohorts collected?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "All cohorts collected?": {
+   "main": [
+    [
+     {
+      "node": "05 \u00b7 Assemble the day-folder tree",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Cohorts incomplete",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Cohorts incomplete": {
+   "main": [
+    [
+     {
+      "node": "Build the release command",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Stop or crash?": {
+   "main": [
+    [
+     {
+      "node": "Build the question",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Explain the halt",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build the question": {
+   "main": [
+    [
+     {
+      "node": "Ask (amber, with the resume link)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Ask (amber, with the resume link)": {
+   "main": [
+    [
+     {
+      "node": "Wait for the decision",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Wait for the decision": {
+   "main": [
+    [
+     {
+      "node": "Answered in time?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Answered in time?": {
+   "main": [
+    [
+     {
+      "node": "Build the apply command",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Nobody answered",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build the apply command": {
+   "main": [
+    [
+     {
+      "node": "Record the decision",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Record the decision": {
+   "main": [
+    [
+     {
+      "node": "Was it accepted?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Was it accepted?": {
+   "main": [
+    [
+     {
+      "node": "Build the release command",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Nobody answered": {
+   "main": [
+    [
+     {
+      "node": "Build the release command",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "08 \u00b7 Client portfolios": {
+   "main": [
+    [
+     {
+      "node": "08 ok?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "08 ok?": {
+   "main": [
+    [
+     {
+      "node": "Deliver",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Stop or crash?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Deliver": {
+   "main": [
+    [
+     {
+      "node": "Build the release command",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v1",
+  "executionTimeout": -1,
+  "saveExecutionProgress": true,
+  "saveDataSuccessExecution": "all",
+  "saveDataErrorExecution": "all",
+  "errorWorkflow": "rbl-error-handler"
+ },
+ "pinData": {}
+}

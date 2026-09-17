@@ -1,0 +1,766 @@
+{
+ "id": "rbl-cohort-loop",
+ "name": "RBL \u00b7 Cohort Loop",
+ "nodes": [
+  {
+   "parameters": {
+    "inputSource": "workflowInputs",
+    "workflowInputs": {
+     "values": [
+      {
+       "name": "month",
+       "type": "string"
+      },
+      {
+       "name": "dryRun",
+       "type": "boolean"
+      },
+      {
+       "name": "runId",
+       "type": "string"
+      }
+     ]
+    }
+   },
+   "id": "cl-trigger",
+   "name": "When called by the Orchestrator",
+   "type": "n8n-nodes-base.executeWorkflowTrigger",
+   "typeVersion": 1.1,
+   "position": [
+    -1200,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-stage-runner",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Stage Runner"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "stage": "03",
+      "month": "={{ $json.month }}",
+      "args": "--list-cohorts",
+      "label": "List cohorts"
+     }
+    },
+    "options": {}
+   },
+   "id": "cl-list",
+   "name": "List the cohorts",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    -980,
+    300
+   ],
+   "notes": "Reads the plan and state. `collected` on each cohort is what makes the loop resumable."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "listed",
+       "leftValue": "={{ $json.outcome }}",
+       "rightValue": "done",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "cl-if-listed",
+   "name": "Listed?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    -760,
+    300
+   ],
+   "notes": "False usually means stage 02 has not produced a plan yet \u2014 nothing to loop over."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* The resume path, and it must hold on EVERY re-run rather than only the first.\n\n   Stage 03 routinely takes an hour and fails part-way. If a re-run re-fires\n   cohorts that were already collected, it does not merely waste time: each\n   trigger takes Convin's global per-tenant lock for 4-6 minutes, so re-doing\n   thirteen collected cohorts blocks the tenant for an hour to achieve nothing.\n   `collected` comes from stage 03's --list-cohorts, which reads state \u2014 so this\n   filter is the same one a terminal re-run would apply. */\n\nconst env = $input.first().json;\nconst called = $('When called by the Orchestrator').first().json;\nconst all = env.json?.cohorts ?? [];\nconst todo = all.filter((c) => !c.collected);\n\nreturn [{\n  json: {\n    month: called.month,\n    dryRun: called.dryRun === true || called.dryRun === 'true',\n    runId: called.runId ?? '',\n    total: all.length,\n    alreadyCollected: all.length - todo.length,\n    todo,\n  },\n}];"
+   },
+   "id": "cl-pick",
+   "name": "Pick the uncollected",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -540,
+    220
+   ]
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "any",
+       "leftValue": "={{ $json.todo.length }}",
+       "rightValue": 0,
+       "operator": {
+        "type": "number",
+        "operation": "gt"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "cl-if-any",
+   "name": "Any uncollected?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    -320,
+    220
+   ],
+   "notes": "False means every cohort is already collected \u2014 a re-run of a finished month does nothing, which is the point."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* One item per cohort. Split In Batches then takes them one at a time \u2014\n   Convin enforces one job per tenant server-side, so concurrency buys nothing\n   and risks a mis-fire, and one cohort per iteration is what makes a stall\n   visible as its own row while it is happening rather than after two hours of\n   silence. */\nconst j = $input.first().json;\nreturn j.todo.map((c) => ({ json: { ...c, key: c.key, month: j.month, dryRun: j.dryRun, runId: j.runId } }));"
+   },
+   "id": "cl-fan",
+   "name": "Fan out",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -100,
+    140
+   ]
+  },
+  {
+   "parameters": {
+    "batchSize": 1,
+    "options": {}
+   },
+   "id": "cl-batch",
+   "name": "Next cohort",
+   "type": "n8n-nodes-base.splitInBatches",
+   "typeVersion": 3,
+   "position": [
+    120,
+    140
+   ],
+   "notes": "One cohort per iteration. Convin holds a global per-tenant lock, so concurrency buys nothing \u2014 and one row per cohort is what makes a stall visible while it is happening."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Attempt counter for the cohort currently in the loop.\n\n   Two paths reach this node: a fresh cohort out of Split In Batches (no attempt\n   yet \u2192 1), and the backoff Wait on a retry (attempt N \u2192 N+1). Keeping the\n   count on the item rather than in state is deliberate \u2014 the retry policy is a\n   workflow concern (\u00a73.4) and state should record what happened, not how many\n   times n8n tried. */\nconst j = $input.first().json;\nconst attempt = Number(j.attempt || 0) + 1;\nreturn [{ json: { ...j, attempt } }];"
+   },
+   "id": "cl-attempt",
+   "name": "Attempt",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    340,
+    240
+   ]
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-stage-runner",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Stage Runner"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "stage": "03",
+      "month": "={{ $json.month }}",
+      "args": "={{ ($json.dryRun ? '--dry-run ' : '') + '--cohort ' + $json.key }}",
+      "label": "Export cohort"
+     }
+    },
+    "options": {}
+   },
+   "id": "cl-03",
+   "name": "03 \u00b7 Export cohort",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    560,
+    240
+   ],
+   "notes": "Fires the Convin export for one cohort and verifies request_params server-side before waiting."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "e03",
+       "leftValue": "={{ $json.outcome }}",
+       "rightValue": "done",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "cl-if-03",
+   "name": "03 ok?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    780,
+    240
+   ],
+   "notes": "crash \u2192 retry with backoff. stop \u2192 escalate now, amber."
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-stage-runner",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Stage Runner"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "stage": "04",
+      "month": "={{ $('Attempt').first().json.month }}",
+      "args": "={{ ($('Attempt').first().json.dryRun ? '--dry-run ' : '') + '--cohort ' + $('Attempt').first().json.key }}",
+      "label": "Collect cohort"
+     }
+    },
+    "options": {}
+   },
+   "id": "cl-04",
+   "name": "04 \u00b7 Collect cohort",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    1000,
+    160
+   ],
+   "notes": "Collects the report email and runs repair_calllog.mjs. A non-zero repair exit is fatal."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "e04",
+       "leftValue": "={{ $json.outcome }}",
+       "rightValue": "done",
+       "operator": {
+        "type": "string",
+        "operation": "equals"
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "cl-if-04",
+   "name": "04 ok?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    1220,
+    160
+   ],
+   "notes": "Same retry policy as 03 \u2014 the same cohort is re-exported and re-collected."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* This cohort is done. Emit a small result that Split In Batches accumulates\n   for the summary \u2014 the collection itself was already recorded in state by\n   stage 04. */\nconst a = $('Attempt').first().json;\nreturn [{ json: { key: a.key, campaign: a.campaign, status: 'collected', attempts: a.attempt } }];"
+   },
+   "id": "cl-collected",
+   "name": "Collected",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1440,
+    80
+   ]
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Retry, or give up on this cohort and move on.\n\n   \u00a73.4 retries a CRASH: Convin's queue cannot be made reliable by code \u2014 one\n   job failed outright, another hung 100+ minutes holding the global lock \u2014 so\n   backoff and re-fire is the whole strategy. 5, 10, 20 minutes, three attempts.\n\n   A STOP is not retried. It is the pipeline asking a human a question (a 401\n   with no Playwright credentials, a subject pattern that does not match), and\n   asking it again in five minutes, three times, only delays the escalation by\n   35 minutes. It escalates immediately \u2014 and AMBER, because a question is not\n   a fault.\n\n   What must never happen either way: a failed export becoming \"no calls\". Two\n   August failures looked exactly like calling had stopped, and their retries\n   returned 8,250 and 9,044 rows of real activity. So the cohort is recorded as\n   FAILED, never as collected-and-empty, and the month is then incomplete. */\n\nconst MAX_ATTEMPTS = 3;\nconst a = $('Attempt').first().json;\nconst env = $input.first().json;\n\nconst isStop = env.outcome === 'stop';\nconst attempt = Number(a.attempt || 1);\nconst stageJson = env.json ?? {};\nconst reason = stageJson.reason || env.contractViolation || (env.stderrTail || '').slice(-400) || 'no reason reported';\n\nconst retry = !isStop && attempt < MAX_ATTEMPTS;\nconst waitMinutes = 5 * Math.pow(2, attempt - 1); // 5 \u00b7 10 \u00b7 20\n\nreturn [{\n  json: {\n    ...a,\n    retry,\n    waitMinutes,\n    attempt,\n    failedStage: env.stage,\n    outcome: env.outcome,\n    reason,\n    severity: isStop ? 'stop' : 'fail',\n    escalationTitle: isStop\n      ? 'cohort ' + a.key + ' needs a decision'\n      : 'cohort ' + a.key + ' failed after ' + attempt + ' attempt(s)',\n    escalationBody: [\n      (isStop ? 'Stopped' : 'Crashed') + ' at stage ' + env.stage + ' on cohort ' + a.key + ', attempt ' + attempt + ' of ' + MAX_ATTEMPTS + '.',\n      '',\n      reason,\n      '',\n      isStop\n        ? 'This is a question, not a fault. The other cohorts continue.'\n        : 'The other cohorts continue. This one is recorded as FAILED, not as a cohort with no calls \u2014 a failed export must never be read as \"nobody was dialled\".',\n      '',\n      'The month will be treated as INCOMPLETE, and stages 05-07 will not run until this is resolved.',\n    ].join('\\n'),\n  },\n}];"
+   },
+   "id": "cl-decide",
+   "name": "Decide retry",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1000,
+    420
+   ],
+   "notes": "Crash \u2192 up to 3 attempts, 5/10/20 minutes apart. Stop \u2192 escalate immediately, amber. Never converts a failure into \"no calls\"."
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "leftValue": "",
+      "typeValidation": "strict",
+      "version": 2
+     },
+     "conditions": [
+      {
+       "id": "retry",
+       "leftValue": "={{ $json.retry }}",
+       "rightValue": true,
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    },
+    "options": {}
+   },
+   "id": "cl-if-retry",
+   "name": "Retry?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    1220,
+    420
+   ],
+   "notes": "True \u2192 back off and re-fire. False \u2192 mark failed, escalate, carry on with the rest."
+  },
+  {
+   "parameters": {
+    "amount": "={{ $json.waitMinutes }}",
+    "unit": "minutes"
+   },
+   "id": "cl-wait",
+   "name": "Back off",
+   "type": "n8n-nodes-base.wait",
+   "typeVersion": 1.1,
+   "position": [
+    1440,
+    500
+   ],
+   "webhookId": "rbl-cohort-backoff",
+   "notes": "2^(attempt-1) \u00d7 5 minutes: 5, 10, 20. Convin jobs take 4-6 minutes when healthy, so a shorter first wait would re-fire into a job that is still running."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Record the failure in state/<month>.json. Quoting discipline as everywhere\n   else: the only place a value reaches a shell is a Code node that quotes every\n   token. */\nconst j = $input.first().json;\nconst q = (s) => \"'\" + String(s).replace(/'/g, \"'\\\\''\") + \"'\";\nconst repo = $vars.RBL_REPO;\nif (!repo) throw new Error('n8n variable RBL_REPO is not set \u2014 see n8n/SETUP_MONTH_PIPELINE.md');\n\nconst reason = 'stage ' + j.failedStage + ' ' + j.outcome + ' after ' + j.attempt + ' attempt(s): ' + String(j.reason).slice(0, 300);\n\nconst command = 'cd ' + q(repo)\n  + ' && npm run pipeline --silent -- --stage 03 --month ' + q(j.month)\n  + ' --cohort ' + q(j.key)\n  + ' --mark-failed --reason ' + q(reason)\n  + ' --json';\n\nreturn [{ json: { ...j, command, markReason: reason } }];"
+   },
+   "id": "cl-mark-cmd",
+   "name": "Build the mark-failed command",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1440,
+    340
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=( {{ $json.command }} ); printf '__EXIT__%s\\n' \"$?\""
+   },
+   "id": "cl-mark",
+   "name": "Mark the cohort failed",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    1660,
+    340
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "Writes failed:true into state/<month>.json. A failed cohort must stay visibly failed \u2014 never readable downstream as a cohort with no calls. The command is wrapped so the shell always exits 0 and the real code travels in stdout as __EXIT__<code>. Measured on n8n 2.35.7: this node reports exitCode ONLY when the command exits 0 \u2014 on any non-zero exit it emits { error } alone, dropping both exitCode and stdout, with the stderr text as the message. That makes an exit 10 (a human must decide) indistinguishable from a crash, and loses the JSON line the contract is built on. onError:continueRegularOutput keeps the workflow running but does not restore the fields."
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-notify",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Notify"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "severity": "={{ $('Decide retry').first().json.severity }}",
+      "runId": "={{ $('Decide retry').first().json.runId }}",
+      "month": "={{ $('Decide retry').first().json.month }}",
+      "stage": "={{ $('Decide retry').first().json.failedStage }}",
+      "title": "={{ $('Decide retry').first().json.escalationTitle }}",
+      "body": "={{ $('Decide retry').first().json.escalationBody }}",
+      "resumeUrl": "",
+      "executionUrl": "",
+      "attachments": ""
+     }
+    },
+    "options": {}
+   },
+   "id": "cl-escalate",
+   "name": "Escalate",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    1880,
+    340
+   ],
+   "notes": "Amber for a stop, red for a crash. The severity comes from the outcome, not from the fact that we gave up."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Marked failed and escalated. Continue with the remaining cohorts: one stuck\n   cohort must not cost the other thirteen (\u00a73.4). */\nconst j = $('Decide retry').first().json;\nreturn [{ json: { key: j.key, campaign: j.campaign, status: 'failed', attempts: j.attempt, outcome: j.outcome, reason: j.reason } }];"
+   },
+   "id": "cl-failed",
+   "name": "Failed",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2100,
+    340
+   ]
+  },
+  {
+   "parameters": {
+    "jsCode": "/* What the Orchestrator acts on.\n\n   \u00a73.4 step 6: if any cohort ended failed, the month is INCOMPLETE and stages\n   05-08 must not run. Building a report on a month where one cohort's calls\n   never arrived produces a book whose AI figures are silently short \u2014 which is\n   the exact shape of wrongness this pipeline exists to refuse. */\nconst called = $('When called by the Orchestrator').first().json;\nconst picked = $('Pick the uncollected').first().json;\n\nconst items = $input.all().map((i) => i.json).filter((i) => i && i.status);\nconst collected = items.filter((i) => i.status === 'collected');\nconst failed = items.filter((i) => i.status === 'failed');\n\nconst monthIncomplete = failed.length > 0;\n\nreturn [{\n  json: {\n    ok: !monthIncomplete,\n    month: called.month,\n    runId: called.runId ?? '',\n    dryRun: picked.dryRun === true,\n    cohorts: picked.total,\n    alreadyCollected: picked.alreadyCollected,\n    attempted: items.length,\n    collected: collected.length,\n    failed: failed.map((f) => ({ key: f.key, outcome: f.outcome, attempts: f.attempts, reason: f.reason })),\n    monthIncomplete,\n    reason: monthIncomplete\n      ? failed.length + ' of ' + items.length + ' cohort(s) failed \u2014 the month is incomplete and stages 05-07 must not run on it'\n      : items.length === 0\n        ? 'every cohort was already collected \u2014 nothing to do'\n        : 'all ' + collected.length + ' cohort(s) collected',\n  },\n}];"
+   },
+   "id": "cl-summary",
+   "name": "Summarise the loop",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    340,
+    40
+   ],
+   "notes": "monthIncomplete=true means the Orchestrator must skip stages 05-07 rather than build on partial data."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Stage 03 --list-cohorts did not return a list, so there is nothing to loop\n   over and no way to tell what is outstanding. Usually: stage 02 has not\n   produced a plan yet. */\nconst env = $input.first().json;\nconst called = $('When called by the Orchestrator').first().json;\nconst stageJson = env.json ?? {};\nreturn [{\n  json: {\n    ok: false,\n    month: called.month,\n    runId: called.runId ?? '',\n    cohorts: 0, collected: 0, failed: [], attempted: 0,\n    monthIncomplete: true,\n    outcome: env.outcome,\n    reason: 'could not list cohorts (stage 03 --list-cohorts ' + env.outcome + '): ' + (stageJson.reason || env.contractViolation || env.stderrTail || 'no reason reported'),\n  },\n}];"
+   },
+   "id": "cl-cannot",
+   "name": "Cannot list cohorts",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -540,
+    420
+   ]
+  }
+ ],
+ "connections": {
+  "When called by the Orchestrator": {
+   "main": [
+    [
+     {
+      "node": "List the cohorts",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "List the cohorts": {
+   "main": [
+    [
+     {
+      "node": "Listed?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Listed?": {
+   "main": [
+    [
+     {
+      "node": "Pick the uncollected",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Cannot list cohorts",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Pick the uncollected": {
+   "main": [
+    [
+     {
+      "node": "Any uncollected?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Any uncollected?": {
+   "main": [
+    [
+     {
+      "node": "Fan out",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Summarise the loop",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Fan out": {
+   "main": [
+    [
+     {
+      "node": "Next cohort",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Next cohort": {
+   "main": [
+    [
+     {
+      "node": "Summarise the loop",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Attempt",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Attempt": {
+   "main": [
+    [
+     {
+      "node": "03 \u00b7 Export cohort",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "03 \u00b7 Export cohort": {
+   "main": [
+    [
+     {
+      "node": "03 ok?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "03 ok?": {
+   "main": [
+    [
+     {
+      "node": "04 \u00b7 Collect cohort",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Decide retry",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "04 \u00b7 Collect cohort": {
+   "main": [
+    [
+     {
+      "node": "04 ok?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "04 ok?": {
+   "main": [
+    [
+     {
+      "node": "Collected",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Decide retry",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Collected": {
+   "main": [
+    [
+     {
+      "node": "Next cohort",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Decide retry": {
+   "main": [
+    [
+     {
+      "node": "Retry?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Retry?": {
+   "main": [
+    [
+     {
+      "node": "Back off",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Build the mark-failed command",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Back off": {
+   "main": [
+    [
+     {
+      "node": "Attempt",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build the mark-failed command": {
+   "main": [
+    [
+     {
+      "node": "Mark the cohort failed",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Mark the cohort failed": {
+   "main": [
+    [
+     {
+      "node": "Escalate",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Escalate": {
+   "main": [
+    [
+     {
+      "node": "Failed",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Failed": {
+   "main": [
+    [
+     {
+      "node": "Next cohort",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v1",
+  "executionTimeout": -1,
+  "saveExecutionProgress": true,
+  "saveDataSuccessExecution": "all",
+  "saveDataErrorExecution": "all",
+  "errorWorkflow": "rbl-error-handler"
+ },
+ "pinData": {}
+}

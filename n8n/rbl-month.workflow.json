@@ -1,0 +1,928 @@
+{
+ "id": "rbl-month",
+ "name": "RBL \u2014 full month pipeline",
+ "nodes": [
+  {
+   "parameters": {},
+   "id": "trigger-manual",
+   "name": "Run manually",
+   "type": "n8n-nodes-base.manualTrigger",
+   "typeVersion": 1,
+   "position": [
+    -820,
+    200
+   ]
+  },
+  {
+   "parameters": {
+    "rule": {
+     "interval": [
+      {
+       "field": "cronExpression",
+       "expression": "0 7 2 * *"
+      }
+     ]
+    }
+   },
+   "id": "trigger-schedule",
+   "name": "Monthly (2nd, 07:00) \u2014 disabled",
+   "type": "n8n-nodes-base.scheduleTrigger",
+   "typeVersion": 1.2,
+   "position": [
+    -820,
+    400
+   ],
+   "disabled": true,
+   "notes": "Enable only after a full month has been run in parallel with the manual process and every number matched."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* The month to build. Defaults to the PREVIOUS calendar month, because the run\n   happens on the 2nd and builds the month that just closed. Override by setting\n   the n8n variable RBL_MONTH (format YYYY-MM) for a re-run of an older month. */\nconst override = $vars.RBL_MONTH;\nlet month = override;\nif (!month) {\n  const d = new Date();\n  d.setUTCDate(1);\n  d.setUTCMonth(d.getUTCMonth() - 1);\n  month = d.toISOString().slice(0, 7);\n}\nif (!/^\\d{4}-\\d{2}$/.test(month)) throw new Error(`RBL_MONTH must be YYYY-MM, got ${JSON.stringify(month)}`);\n/* A runId, because the month lock is per-run: releasing one you cannot prove\n   is yours would leave two writers on one month, and lock.mjs refuses to. */\nconst runId = 'rbl-month-' + new Date().toISOString().replace(/[:.]/g, '-');\n\n/* Published so the Error Handler can find the month and runId on a crash \u2014 it\n   is handed the failing execution, not our data. Wrapped because customData is\n   not available in every execution mode and its absence must not be the thing\n   that fails the run. */\ntry {\n  $execution.customData.set('month', month);\n  $execution.customData.set('runId', runId);\n} catch (e) { /* not available in this mode; the handler falls back */ }\n\nreturn [{ json: { month, runId, startedAt: new Date().toISOString() } }];"
+   },
+   "id": "set-month",
+   "name": "Resolve month",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -600,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=cd \"{{ $vars.RBL_REPO }}\" && npm run pipeline -- --stage 00 --month {{ $json.month }} --json; echo \"__EXIT__$?\""
+   },
+   "id": "s00",
+   "name": "00 \u00b7 Preflight",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    -380,
+    300
+   ],
+   "notes": "Checks .env.local is complete, S3 is reachable, the Convin token is live, and the output disk has room. Cheap, and it fails here instead of an hour into stage 03."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Shared parse. Every stage prints exactly one line of JSON last, then an\n   __EXIT__<code> marker. Exit codes: 0 = done \u00b7 10 = deliberate stop, needs a\n   human \u00b7 anything else = crash.\n\n   The marker exists so a deliberate stop does not surface as a red node. A stop\n   is information, not a fault \u2014 only a crash should look like one. */\nconst STAGE = '00 Preflight';\nconst raw = ($input.first().json.stdout || '') + '\\n' + ($input.first().json.stderr || '');\nconst lines = raw.trim().split('\\n');\nconst marker = lines.find(l => l.startsWith('__EXIT__'));\nconst exitCode = marker ? Number(marker.slice(8).trim()) : 0;\nconst jsonLine = [...lines].reverse().find(l => l.trim().startsWith('{'));\nif (!jsonLine) throw new Error(`${STAGE} printed no JSON (exit ${exitCode}).\\n--- tail ---\\n` + raw.slice(-1200));\nlet r;\ntry { r = JSON.parse(jsonLine); }\ncatch (e) { throw new Error(`${STAGE} JSON did not parse (exit ${exitCode}): ${e.message}\\n` + jsonLine.slice(0, 600)); }\nif (exitCode !== 0 && exitCode !== 10) throw new Error(`${STAGE} failed (exit ${exitCode}): ${r.error || 'no error field'}\\n--- tail ---\\n` + raw.slice(-1200));\nreturn [{ json: { ...r, exitCode, month: $('Resolve month').first().json.month } }];"
+   },
+   "id": "p00",
+   "name": "Parse 00",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -180,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=cd \"{{ $vars.RBL_REPO }}\" && npm run pipeline -- --stage 01 --month {{ $json.month }} --json; echo \"__EXIT__$?\""
+   },
+   "id": "s01",
+   "name": "01 \u00b7 Fetch from S3",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    20,
+    300
+   ],
+   "notes": "Books + status files. Records each object's Date Added as the load date S \u2014 authoritative, never inferred from the filename. Skips what it already has, so re-running is free."
+  },
+  {
+   "parameters": {
+    "jsCode": "const STAGE = '01 Fetch';\nconst raw = ($input.first().json.stdout || '') + '\\n' + ($input.first().json.stderr || '');\nconst lines = raw.trim().split('\\n');\nconst marker = lines.find(l => l.startsWith('__EXIT__'));\nconst exitCode = marker ? Number(marker.slice(8).trim()) : 0;\nconst jsonLine = [...lines].reverse().find(l => l.trim().startsWith('{'));\nif (!jsonLine) throw new Error(`${STAGE} printed no JSON (exit ${exitCode}).\\n--- tail ---\\n` + raw.slice(-1200));\nlet r;\ntry { r = JSON.parse(jsonLine); }\ncatch (e) { throw new Error(`${STAGE} JSON did not parse (exit ${exitCode}): ${e.message}\\n` + jsonLine.slice(0, 600)); }\nif (exitCode !== 0 && exitCode !== 10) throw new Error(`${STAGE} failed (exit ${exitCode}): ${r.error || 'no error field'}\\n--- tail ---\\n` + raw.slice(-1200));\nif (!r.books || r.books === 0) throw new Error('01 Fetch found no books. Check S3_PREFIX_BOOKS and that the month has actually been delivered.');\nreturn [{ json: { ...r, exitCode, month: $('Resolve month').first().json.month } }];"
+   },
+   "id": "p01",
+   "name": "Parse 01",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    220,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=cd \"{{ $vars.RBL_REPO }}\" && npm run pipeline -- --stage 02 --month {{ $json.month }} --json; echo \"__EXIT__$?\""
+   },
+   "id": "s02",
+   "name": "02 \u00b7 Plan + campaign assignment",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    420,
+    300
+   ],
+   "notes": "Reads cached assignments from state/campaigns.json. If every book name is known, it plans and continues. If any book is new \u2014 or plan_month.mjs emits any warning \u2014 it exits 10 and the run stops for a human. This is the one deliberate stop in the pipeline."
+  },
+  {
+   "parameters": {
+    "jsCode": "const STAGE = '02 Plan';\nconst raw = ($input.first().json.stdout || '') + '\\n' + ($input.first().json.stderr || '');\nconst lines = raw.trim().split('\\n');\nconst marker = lines.find(l => l.startsWith('__EXIT__'));\nconst exitCode = marker ? Number(marker.slice(8).trim()) : 0;\nconst jsonLine = [...lines].reverse().find(l => l.trim().startsWith('{'));\nif (!jsonLine) throw new Error(`${STAGE} printed no JSON (exit ${exitCode}).\\n--- tail ---\\n` + raw.slice(-1200));\nlet r;\ntry { r = JSON.parse(jsonLine); }\ncatch (e) { throw new Error(`${STAGE} JSON did not parse (exit ${exitCode}): ${e.message}\\n` + jsonLine.slice(0, 600)); }\nif (exitCode !== 0 && exitCode !== 10) throw new Error(`${STAGE} failed (exit ${exitCode}): ${r.error || 'no error field'}\\n--- tail ---\\n` + raw.slice(-1200));\n\n/* A planner warning is a stop-and-ask, never a log line. In July these would have\n   caught two books both named \"CYC 12 PDD+7\" that differed only by load date\n   (95 accounts vs 1,296), and the PDD+11/+12 family that had no verified day count. */\nconst needsHuman = exitCode === 10 || !!(r.warnings || []).length || !!(r.unassigned || []).length;\nreturn [{ json: { ...r, exitCode, needsHuman, month: $('Resolve month').first().json.month } }];"
+   },
+   "id": "p02",
+   "name": "Parse 02",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    620,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "version": 2
+     },
+     "conditions": [
+      {
+       "leftValue": "={{ $json.needsHuman }}",
+       "rightValue": true,
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    }
+   },
+   "id": "if-human",
+   "name": "Needs a human?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    820,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "sendTo": "={{ $vars.RBL_NOTIFY_TO }}",
+    "subject": "=RBL {{ $json.month }} \u2014 campaign assignment needed before the run can continue",
+    "message": "=The month cannot be planned without a decision.\n\nUNASSIGNED BOOKS ({{ ($json.unassigned || []).length }}):\n{{ ($json.unassigned || []).map(b => `  ${b.book}   loaded ${b.loadDate}` + (b.suggestion ? `   (last month this name was: ${b.suggestion})` : '   (new name \u2014 never seen before)')).join('\\n') }}\n\nPLANNER WARNINGS ({{ ($json.warnings || []).length }}):\n{{ ($json.warnings || []).join('\\n') }}\n\nWHY THIS STOPS THE RUN\nCampaign decides which status file each book is paired with, and the two use\ndifferent outcome vocabularies \u2014 PreX is Resolved/Unresolved, Bucket is\nUnresolved/Normalisation/STAB/RB. Pair a book with the wrong one and every number\non the report renders and every number is wrong.\n\nTO CONTINUE\n1. Edit  {{ $vars.RBL_REPO }}/state/campaigns.json\n2. Add an entry per book:  \"CYC 17 Convin\": { \"campaign\": \"bucket\", \"days\": 5 }\n3. Re-run this workflow. Stages 00 and 01 will skip what they already fetched.",
+    "options": {}
+   },
+   "id": "email-assign",
+   "name": "Email \u2014 assignment needed",
+   "type": "n8n-nodes-base.gmail",
+   "typeVersion": 2.1,
+   "position": [
+    1040,
+    140
+   ],
+   "notes": "Swap for SMTP or Slack if you don't use Gmail. Credentials live in n8n, never in this file."
+  },
+  {
+   "parameters": {
+    "errorMessage": "=Stopped for campaign assignment \u2014 {{ ($json.unassigned || []).length }} book(s) unassigned, {{ ($json.warnings || []).length }} planner warning(s). See the email for what to edit."
+   },
+   "id": "stop-assign",
+   "name": "Stop \u2014 awaiting assignment",
+   "type": "n8n-nodes-base.stopAndError",
+   "typeVersion": 1,
+   "position": [
+    1260,
+    140
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=cd \"{{ $vars.RBL_REPO }}\" && npm run pipeline -- --stage 03 --month {{ $json.month }} --list-cohorts --json; echo \"__EXIT__$?\""
+   },
+   "id": "s03list",
+   "name": "03a \u00b7 List cohorts",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    1040,
+    460
+   ],
+   "notes": "One pull per (campaign, load date), not one per day \u2014 a cohort export contains every day, sliced later by Call Timestamp. This is what took July from 61 exports down to 21."
+  },
+  {
+   "parameters": {
+    "jsCode": "const STAGE = '03a List cohorts';\nconst raw = ($input.first().json.stdout || '') + '\\n' + ($input.first().json.stderr || '');\nconst lines = raw.trim().split('\\n');\nconst marker = lines.find(l => l.startsWith('__EXIT__'));\nconst exitCode = marker ? Number(marker.slice(8).trim()) : 0;\nconst jsonLine = [...lines].reverse().find(l => l.trim().startsWith('{'));\nif (!jsonLine) throw new Error(`${STAGE} printed no JSON (exit ${exitCode}).\\n--- tail ---\\n` + raw.slice(-1200));\nconst r = JSON.parse(jsonLine);\nif (exitCode !== 0) throw new Error(`${STAGE} failed (exit ${exitCode}): ${r.error || ''}`);\n\nconst month = $('Resolve month').first().json.month;\nconst pending = (r.cohorts || []).filter(c => !c.collected);\nif (!pending.length) return [{ json: { month, key: null, empty: true } }];\n\n/* One item per cohort. The loop below runs them one at a time \u2014 Convin enforces a\n   global per-tenant lock, so parallelism is not available even if it were wanted.\n   The upside of looping in n8n rather than inside the script: each cohort shows as\n   its own row in the execution view, so a stall is visible while it is happening. */\nreturn pending.map(c => ({ json: { ...c, month } }));"
+   },
+   "id": "p03list",
+   "name": "Parse cohorts",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1260,
+    460
+   ]
+  },
+  {
+   "parameters": {
+    "options": {
+     "reset": false
+    }
+   },
+   "id": "loop",
+   "name": "For each cohort",
+   "type": "n8n-nodes-base.splitInBatches",
+   "typeVersion": 3,
+   "position": [
+    1480,
+    460
+   ],
+   "notes": "Batch size 1. Output 'done' (top) continues to stage 05; output 'loop' (bottom) runs one cohort."
+  },
+  {
+   "parameters": {
+    "command": "=cd \"{{ $vars.RBL_REPO }}\" && npm run pipeline -- --stage 03 --month {{ $json.month }} --cohort \"{{ $json.key }}\" --json; echo \"__EXIT__$?\""
+   },
+   "id": "s03",
+   "name": "03b \u00b7 Export one cohort",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    1480,
+    700
+   ],
+   "notes": "Trigger, verify request_params server-side, then poll until the job clears. The script owns the retry policy (cap ~20 min, re-fire, escalate after N) \u2014 deliberately NOT duplicated as an n8n retry, so there is only one place that decides when to give up."
+  },
+  {
+   "parameters": {
+    "jsCode": "const STAGE = '03b Export';\nconst raw = ($input.first().json.stdout || '') + '\\n' + ($input.first().json.stderr || '');\nconst lines = raw.trim().split('\\n');\nconst marker = lines.find(l => l.startsWith('__EXIT__'));\nconst exitCode = marker ? Number(marker.slice(8).trim()) : 0;\nconst jsonLine = [...lines].reverse().find(l => l.trim().startsWith('{'));\nif (!jsonLine) throw new Error(`${STAGE} printed no JSON (exit ${exitCode}).\\n--- tail ---\\n` + raw.slice(-1200));\nconst r = JSON.parse(jsonLine);\n\n/* A failed or hung export means RETRY \u2014 never \"no calls\". In August two consecutive\n   failures looked like calling had stopped; the retries returned 8,250 and 9,044\n   rows of real activity. If the script has exhausted its retries, stop the month\n   rather than letting an empty cohort through. */\nif (exitCode !== 0) throw new Error(`${STAGE} exhausted retries for cohort ${r.key || '?'} (exit ${exitCode}): ${r.error || 'no error field'}\\nDo NOT treat this as \"no calls\" \u2014 re-run the workflow once Convin's queue is healthy.`);\nif (r.rows === 0) throw new Error(`${STAGE} returned 0 rows for cohort ${r.key}. Verify against the campaign UI before accepting \u2014 this pattern has been a queue failure every time it has appeared.`);\nreturn [{ json: r }];"
+   },
+   "id": "p03",
+   "name": "Parse 03",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1700,
+    700
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=cd \"{{ $vars.RBL_REPO }}\" && npm run pipeline -- --stage 04 --month {{ $json.month }} --cohort \"{{ $json.key }}\" --json; echo \"__EXIT__$?\""
+   },
+   "id": "s04",
+   "name": "04 \u00b7 Collect + repair",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    1920,
+    700
+   ],
+   "notes": "Fetches the CSV from EMAIL, not the in-app notification \u2014 that one is websocket-only, held in memory, and single-use: one click consumes it and a reload wipes it. Then runs repair_calllog.mjs, whose non-zero exit is fatal."
+  },
+  {
+   "parameters": {
+    "jsCode": "const STAGE = '04 Collect';\nconst raw = ($input.first().json.stdout || '') + '\\n' + ($input.first().json.stderr || '');\nconst lines = raw.trim().split('\\n');\nconst marker = lines.find(l => l.startsWith('__EXIT__'));\nconst exitCode = marker ? Number(marker.slice(8).trim()) : 0;\nconst jsonLine = [...lines].reverse().find(l => l.trim().startsWith('{'));\nif (!jsonLine) throw new Error(`${STAGE} printed no JSON (exit ${exitCode}).\\n--- tail ---\\n` + raw.slice(-1200));\nconst r = JSON.parse(jsonLine);\nif (exitCode !== 0) throw new Error(`${STAGE} failed for cohort ${r.key || '?'} (exit ${exitCode}): ${r.error || 'no error field'}\\n--- tail ---\\n` + raw.slice(-1200));\n\n/* Cohort account count must equal the sum of the books loaded that day, exactly.\n   That check held 21 times out of 21 across both July campaigns \u2014 it is the\n   strongest single assertion available anywhere in this pipeline. */\nif (r.expectedAccounts != null && r.accounts !== r.expectedAccounts) {\n  throw new Error(`${STAGE} cohort ${r.key}: ${r.accounts} accounts but the books loaded that day sum to ${r.expectedAccounts}. The lead filter did not apply cleanly, or a book is missing.`);\n}\nreturn [{ json: r }];"
+   },
+   "id": "p04",
+   "name": "Parse 04",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2140,
+    700
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=cd \"{{ $vars.RBL_REPO }}\" && npm run pipeline -- --stage 05 --month {{ $('Resolve month').first().json.month }} --json; echo \"__EXIT__$?\""
+   },
+   "id": "s05",
+   "name": "05 \u00b7 Assemble folder tree",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    1700,
+    300
+   ],
+   "notes": "Slices each cohort log into <book>/Day N - <date>/{1,2,3}. A missing status file builds the days that exist and records the gap \u2014 it never silently drops the book. July hit exactly this with Bucket Status 26 July."
+  },
+  {
+   "parameters": {
+    "jsCode": "const STAGE = '05 Assemble';\nconst raw = ($input.first().json.stdout || '') + '\\n' + ($input.first().json.stderr || '');\nconst lines = raw.trim().split('\\n');\nconst marker = lines.find(l => l.startsWith('__EXIT__'));\nconst exitCode = marker ? Number(marker.slice(8).trim()) : 0;\nconst jsonLine = [...lines].reverse().find(l => l.trim().startsWith('{'));\nif (!jsonLine) throw new Error(`${STAGE} printed no JSON (exit ${exitCode}).\\n--- tail ---\\n` + raw.slice(-1200));\nconst r = JSON.parse(jsonLine);\nif (exitCode !== 0 && exitCode !== 10) throw new Error(`${STAGE} failed (exit ${exitCode}): ${r.error || 'no error field'}\\n--- tail ---\\n` + raw.slice(-1200));\nreturn [{ json: { ...r, month: $('Resolve month').first().json.month } }];"
+   },
+   "id": "p05",
+   "name": "Parse 05",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1920,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=cd \"{{ $vars.RBL_REPO }}\" && npm run pipeline -- --stage 06 --month {{ $json.month }} --json; echo \"__EXIT__$?\""
+   },
+   "id": "s06",
+   "name": "06 \u00b7 Build PDFs",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    2140,
+    300
+   ],
+   "notes": "Wraps `npm run reports`. 20\u201340 minutes for a full month. Each book is pushed to the scratch date, exported, then deleted before the next."
+  },
+  {
+   "parameters": {
+    "jsCode": "const STAGE = '06 Build';\nconst raw = ($input.first().json.stdout || '') + '\\n' + ($input.first().json.stderr || '');\nconst lines = raw.trim().split('\\n');\nconst marker = lines.find(l => l.startsWith('__EXIT__'));\nconst exitCode = marker ? Number(marker.slice(8).trim()) : 0;\nconst jsonLine = [...lines].reverse().find(l => l.trim().startsWith('{'));\nif (!jsonLine) throw new Error(`${STAGE} printed no JSON (exit ${exitCode}).\\n--- tail ---\\n` + raw.slice(-1200));\nconst r = JSON.parse(jsonLine);\nif (exitCode !== 0 && exitCode !== 10) throw new Error(`${STAGE} failed (exit ${exitCode}): ${r.error || 'no error field'}\\n--- tail ---\\n` + raw.slice(-1200));\nreturn [{ json: { ...r, month: $('Resolve month').first().json.month } }];"
+   },
+   "id": "p06",
+   "name": "Parse 06",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2360,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=cd \"{{ $vars.RBL_REPO }}\" && npm run pipeline -- --stage 07 --month {{ $json.month }} --json; echo \"__EXIT__$?\""
+   },
+   "id": "s07",
+   "name": "07 \u00b7 Verify",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    2580,
+    300
+   ],
+   "notes": "Independent of the build log \u2014 it re-reads the artefacts. Account counts vs the book file, zero-attempt detection, cohort totals never exceeded, PDF header and EOF."
+  },
+  {
+   "parameters": {
+    "jsCode": "const STAGE = '07 Verify';\nconst raw = ($input.first().json.stdout || '') + '\\n' + ($input.first().json.stderr || '');\nconst lines = raw.trim().split('\\n');\nconst marker = lines.find(l => l.startsWith('__EXIT__'));\nconst exitCode = marker ? Number(marker.slice(8).trim()) : 0;\nconst jsonLine = [...lines].reverse().find(l => l.trim().startsWith('{'));\nif (!jsonLine) throw new Error(`${STAGE} printed no JSON (exit ${exitCode}).\\n--- tail ---\\n` + raw.slice(-1200));\nconst r = JSON.parse(jsonLine);\n\n/* Zero AI attempts is the signature of the call log reaching the joiner as an\n   ordinary lookup sheet: accounts, outstanding and recovered all still read\n   correctly and only the behavioural half collapses. It cannot be caught by eye,\n   so it is caught here. */\nconst problems = [];\nif (r.failedCount) problems.push(`${r.failedCount} book(s) failed to build`);\nfor (const f of (r.failures || [])) problems.push(`  ${f.check}: ${f.detail}`);\nif ((r.zeroAttemptBooks || []).length) problems.push(`ZERO AI ATTEMPTS \u2014 do not ship: ${r.zeroAttemptBooks.join(', ')}`);\nif ((r.accountMismatch || []).length) problems.push(`account count != book file: ${r.accountMismatch.join(', ')}`);\nif ((r.badPdfs || []).length) problems.push(`malformed PDF: ${r.badPdfs.join(', ')}`);\nif ((r.gaps || []).length) problems.push(`incomplete (missing status file): ${r.gaps.map(g => `${g.book} day ${g.day}`).join(', ')}`);\n\nreturn [{ json: { ...r, problems, healthy: problems.length === 0, month: $('Resolve month').first().json.month } }];"
+   },
+   "id": "p07",
+   "name": "Parse 07",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2800,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "conditions": {
+     "options": {
+      "caseSensitive": true,
+      "version": 2
+     },
+     "conditions": [
+      {
+       "leftValue": "={{ $json.healthy }}",
+       "rightValue": true,
+       "operator": {
+        "type": "boolean",
+        "operation": "true",
+        "singleValue": true
+       }
+      }
+     ],
+     "combinator": "and"
+    }
+   },
+   "id": "if-healthy",
+   "name": "All checks pass?",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 2,
+   "position": [
+    3020,
+    300
+   ]
+  },
+  {
+   "parameters": {
+    "sendTo": "={{ $vars.RBL_NOTIFY_TO }}",
+    "subject": "=RBL {{ $json.month }} reports ready \u2014 {{ $json.built }} book(s)",
+    "message": "=All acceptance checks passed.\n\n  books      {{ $json.built }}\n  accounts   {{ $json.accounts }}\n  attempts   {{ $json.attempts }}\n  cohorts    {{ $json.cohorts }}\n\nPDFs: {{ $json.outDir }}\n\n{{ ($json.reports || []).map(r => `  ${r.book} \u2014 ${r.accounts} accounts, ${r.attempts} attempts`).join('\\n') }}",
+    "options": {}
+   },
+   "id": "email-ok",
+   "name": "Email \u2014 month complete",
+   "type": "n8n-nodes-base.gmail",
+   "typeVersion": 2.1,
+   "position": [
+    3240,
+    180
+   ]
+  },
+  {
+   "parameters": {
+    "sendTo": "={{ $vars.RBL_NOTIFY_TO }}",
+    "subject": "=RBL {{ $json.month }} NEEDS ATTENTION \u2014 {{ ($json.problems || []).length }} problem(s)",
+    "message": "=Do not ship these until the problems below are resolved.\n\n{{ ($json.problems || []).join('\\n') }}\n\nBuilt anyway: {{ $json.built }}\nPDFs: {{ $json.outDir }}\n\nA report that shows zero AI attempts still displays correct accounts, outstanding\nand recovered figures \u2014 the error is invisible on the page. Treat any zero-attempt\nbook as a failed build, not a quiet month.",
+    "options": {}
+   },
+   "id": "email-bad",
+   "name": "Email \u2014 problems",
+   "type": "n8n-nodes-base.gmail",
+   "typeVersion": 2.1,
+   "position": [
+    3240,
+    420
+   ]
+  },
+  {
+   "parameters": {
+    "jsCode": "/* THE MONTH LOCK, WHICH THIS WORKFLOW USED TO RUN WITHOUT.\n   rbl-month predates the lock and never took one, so running it \u2014 the fallback\n   reached for when something is already going wrong \u2014 alongside the\n   Orchestrator put two writers on one month with nothing to warn either. That\n   is the corruption the lock exists to prevent, and it is hardest to unpick\n   afterwards. */\nconst r = $input.first().json;\nconst repo = $vars.RBL_REPO;\nif (!repo) throw new Error('n8n variable RBL_REPO is not set \u2014 see n8n/SETUP_MONTH_PIPELINE.md');\nconst q = (s) => \"'\" + String(s).replace(/'/g, \"'\\\\''\") + \"'\";\nconst command = 'cd ' + q(repo)\n  + ' && npm run pipeline --silent -- --stage lock --month ' + q(r.month)\n  + ' --acquire --run-id ' + q(r.runId)\n  + ' --json';\nreturn [{ json: { ...r, command } }];"
+   },
+   "id": "m-lock-build",
+   "name": "Build the lock command",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -40,
+    -160
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=( {{ $json.command }} ); printf '__EXIT__%s\\n' \"$?\""
+   },
+   "id": "m-lock-run",
+   "name": "Acquire the month lock",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    180,
+    -160
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "The __EXIT__ sentinel is load-bearing. Measured on n8n 2.35.7: this node reports exitCode ONLY when the command exits 0 \u2014 on any non-zero exit it emits { error } alone, dropping exitCode AND stdout. lock.mjs exits 10 for \"someone else holds this month\", which is a decision, not a crash. Without the sentinel that is indistinguishable from a failure. Do not tidy it away."
+  },
+  {
+   "parameters": {
+    "jsCode": "const r = $('Resolve month').first().json;\nconst out = $('Acquire the month lock').first().json;\n\nconst stdoutRaw = String(out.stdout ?? '');\nconst sentinelMatch = [...stdoutRaw.matchAll(/^__EXIT__(\\d+)\\s*$/gm)].pop();\nconst exitCode = sentinelMatch ? Number(sentinelMatch[1])\n  : (Number.isFinite(Number(out.exitCode)) ? Number(out.exitCode) : (out.error ? 1 : 0));\nconst stdout = stdoutRaw.replace(/^__EXIT__\\d+\\s*$/gm, '');\nconst line = stdout.split('\\n').map((l) => l.trim()).filter((l) => l.startsWith('{')).pop();\nlet res = null;\ntry { res = line ? JSON.parse(line) : null; } catch (e) { res = null; }\n\nif (!(exitCode === 0 && res?.acquired === true)) {\n  const h = res?.holder ?? {};\n  throw new Error('Month ' + r.month + ' is locked and this run will not start.\\n'\n    + (res?.reason ?? ('the lock command exited ' + exitCode))\n    + (h.runId ? '\\n  held by runId ' + h.runId + ' on ' + (h.host ?? '?') + ' (pid ' + (h.pid ?? '?') + ')' : '')\n    + '\\n  npm run pipeline -- --stage lock --month ' + r.month + ' --status');\n}\n\n/* Taking a stale lock is legitimate and must be visible: it means a previous\n   run died without releasing. */\nreturn [{ json: { ...r, tookStale: !!res?.tookFrom, lockReason: res?.reason ?? null } }];"
+   },
+   "id": "m-lock-read",
+   "name": "Check the lock",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    400,
+    -160
+   ]
+  },
+  {
+   "parameters": {
+    "jsCode": "const r = $('Resolve month').first().json;\nconst repo = $vars.RBL_REPO;\nconst q = (s) => \"'\" + String(s).replace(/'/g, \"'\\\\''\") + \"'\";\nconst command = 'cd ' + q(repo)\n  + ' && npm run pipeline --silent -- --stage lock --month ' + q(r.month)\n  + ' --release --run-id ' + q(r.runId)\n  + ' --json';\nreturn [{ json: { ...r, command } }];"
+   },
+   "id": "m-rel-end-b",
+   "name": "Build the release (month over)",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2400,
+    500
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=( {{ $json.command }} ); printf '__EXIT__%s\\n' \"$?\""
+   },
+   "id": "m-rel-end-r",
+   "name": "Release the lock (month over)",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    2620,
+    500
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "The __EXIT__ sentinel is load-bearing. Measured on n8n 2.35.7: this node reports exitCode ONLY when the command exits 0 \u2014 on any non-zero exit it emits { error } alone, dropping exitCode AND stdout. lock.mjs exits 10 for \"someone else holds this month\", which is a decision, not a crash. Without the sentinel that is indistinguishable from a failure. Do not tidy it away."
+  },
+  {
+   "parameters": {
+    "jsCode": "const r = $('Resolve month').first().json;\nconst repo = $vars.RBL_REPO;\nconst q = (s) => \"'\" + String(s).replace(/'/g, \"'\\\\''\") + \"'\";\nconst command = 'cd ' + q(repo)\n  + ' && npm run pipeline --silent -- --stage lock --month ' + q(r.month)\n  + ' --release --run-id ' + q(r.runId)\n  + ' --json';\nreturn [{ json: { ...r, command } }];"
+   },
+   "id": "m-rel-stop-b",
+   "name": "Build the release (awaiting a human)",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1200,
+    -160
+   ]
+  },
+  {
+   "parameters": {
+    "command": "=( {{ $json.command }} ); printf '__EXIT__%s\\n' \"$?\""
+   },
+   "id": "m-rel-stop-r",
+   "name": "Release the lock (awaiting a human)",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    1420,
+    -160
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "The __EXIT__ sentinel is load-bearing. Measured on n8n 2.35.7: this node reports exitCode ONLY when the command exits 0 \u2014 on any non-zero exit it emits { error } alone, dropping exitCode AND stdout. lock.mjs exits 10 for \"someone else holds this month\", which is a decision, not a crash. Without the sentinel that is indistinguishable from a failure. Do not tidy it away."
+  }
+ ],
+ "connections": {
+  "Run manually": {
+   "main": [
+    [
+     {
+      "node": "Resolve month",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Monthly (2nd, 07:00) \u2014 disabled": {
+   "main": [
+    [
+     {
+      "node": "Resolve month",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Resolve month": {
+   "main": [
+    [
+     {
+      "node": "Build the lock command",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "00 \u00b7 Preflight": {
+   "main": [
+    [
+     {
+      "node": "Parse 00",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse 00": {
+   "main": [
+    [
+     {
+      "node": "01 \u00b7 Fetch from S3",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "01 \u00b7 Fetch from S3": {
+   "main": [
+    [
+     {
+      "node": "Parse 01",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse 01": {
+   "main": [
+    [
+     {
+      "node": "02 \u00b7 Plan + campaign assignment",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "02 \u00b7 Plan + campaign assignment": {
+   "main": [
+    [
+     {
+      "node": "Parse 02",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse 02": {
+   "main": [
+    [
+     {
+      "node": "Needs a human?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Needs a human?": {
+   "main": [
+    [
+     {
+      "node": "Email \u2014 assignment needed",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "03a \u00b7 List cohorts",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Email \u2014 assignment needed": {
+   "main": [
+    [
+     {
+      "node": "Build the release (awaiting a human)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "03a \u00b7 List cohorts": {
+   "main": [
+    [
+     {
+      "node": "Parse cohorts",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse cohorts": {
+   "main": [
+    [
+     {
+      "node": "For each cohort",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "For each cohort": {
+   "main": [
+    [
+     {
+      "node": "05 \u00b7 Assemble folder tree",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "03b \u00b7 Export one cohort",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "03b \u00b7 Export one cohort": {
+   "main": [
+    [
+     {
+      "node": "Parse 03",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse 03": {
+   "main": [
+    [
+     {
+      "node": "04 \u00b7 Collect + repair",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "04 \u00b7 Collect + repair": {
+   "main": [
+    [
+     {
+      "node": "Parse 04",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse 04": {
+   "main": [
+    [
+     {
+      "node": "For each cohort",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "05 \u00b7 Assemble folder tree": {
+   "main": [
+    [
+     {
+      "node": "Parse 05",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse 05": {
+   "main": [
+    [
+     {
+      "node": "06 \u00b7 Build PDFs",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "06 \u00b7 Build PDFs": {
+   "main": [
+    [
+     {
+      "node": "Parse 06",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse 06": {
+   "main": [
+    [
+     {
+      "node": "07 \u00b7 Verify",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "07 \u00b7 Verify": {
+   "main": [
+    [
+     {
+      "node": "Parse 07",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Parse 07": {
+   "main": [
+    [
+     {
+      "node": "All checks pass?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "All checks pass?": {
+   "main": [
+    [
+     {
+      "node": "Email \u2014 month complete",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "Email \u2014 problems",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build the lock command": {
+   "main": [
+    [
+     {
+      "node": "Acquire the month lock",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Acquire the month lock": {
+   "main": [
+    [
+     {
+      "node": "Check the lock",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Check the lock": {
+   "main": [
+    [
+     {
+      "node": "00 \u00b7 Preflight",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build the release (awaiting a human)": {
+   "main": [
+    [
+     {
+      "node": "Release the lock (awaiting a human)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Release the lock (awaiting a human)": {
+   "main": [
+    [
+     {
+      "node": "Stop \u2014 awaiting assignment",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Email \u2014 month complete": {
+   "main": [
+    [
+     {
+      "node": "Build the release (month over)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Email \u2014 problems": {
+   "main": [
+    [
+     {
+      "node": "Build the release (month over)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build the release (month over)": {
+   "main": [
+    [
+     {
+      "node": "Release the lock (month over)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v1",
+  "executionTimeout": -1,
+  "saveExecutionProgress": true,
+  "saveDataSuccessExecution": "all",
+  "saveDataErrorExecution": "all",
+  "errorWorkflow": "rbl-error-handler"
+ },
+ "pinData": {}
+}

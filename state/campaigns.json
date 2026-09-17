@@ -1,0 +1,33 @@
+{
+ "cyc 12": {
+  "campaign": "bucket",
+  "confirmedAt": "2026-09-02T00:00:00.000Z",
+  "confirmedFrom": "manual (real August Bucket book — see BUCKET_BOOKS.md)"
+ },
+ "cyc 17": {
+  "campaign": "bucket",
+  "confirmedAt": "2026-09-02T00:00:00.000Z",
+  "confirmedFrom": "manual (real August Bucket book — see BUCKET_BOOKS.md)"
+ },
+ "cyc 18 pdd+7": {
+  "campaign": "bucket",
+  "confirmedAt": "2026-09-02T00:00:00.000Z",
+  "confirmedFrom": "manual — name carries a PDD+n suffix but this is a Bucket book; plan_month's name inference gets this one wrong, see pipeline test notes"
+ },
+ "cyc 20 pdd+5": {
+  "campaign": "bucket",
+  "confirmedAt": "2026-09-02T00:00:00.000Z",
+  "confirmedFrom": "manual — same PDD+n-suffix trap as CYC 18 PDD+7"
+ },
+ "22 pdd+2": {
+  "campaign": "prex",
+  "confirmedAt": "2026-09-02T00:00:00.000Z",
+  "confirmedFrom": "manual (real August PreX/PDD book)"
+ },
+ "cyc 08 test": {
+  "campaign": "bucket",
+  "days": 5,
+  "confirmedAt": "2026-09-15T07:20:01.270Z",
+  "confirmedFrom": "2099-10"
+ }
+}

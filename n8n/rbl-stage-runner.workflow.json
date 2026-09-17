@@ -1,0 +1,128 @@
+{
+ "name": "RBL \u00b7 Stage Runner",
+ "nodes": [
+  {
+   "parameters": {
+    "inputSource": "workflowInputs",
+    "workflowInputs": {
+     "values": [
+      {
+       "name": "stage",
+       "type": "string"
+      },
+      {
+       "name": "month",
+       "type": "string"
+      },
+      {
+       "name": "args",
+       "type": "string"
+      },
+      {
+       "name": "label",
+       "type": "string"
+      }
+     ]
+    }
+   },
+   "id": "sr-trigger",
+   "name": "When called by the Orchestrator",
+   "type": "n8n-nodes-base.executeWorkflowTrigger",
+   "typeVersion": 1.1,
+   "position": [
+    -420,
+    300
+   ],
+   "notes": "Inputs: stage \"00\"..\"07\", month \"YYYY-MM\", args (string or array of tokens), label for notifications."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Build the shell command for one stage run.\n\n   This is the only place a caller-supplied value reaches a shell, so quoting\n   happens here and nowhere else.\n\n   A cohort key is \"campaign|YYYY-MM-DD\". That pipe is a shell pipe: passing\n   --cohort bucket|2026-08-13 unquoted would run \"--cohort bucket\" and pipe its\n   output into a command named 2026. Every token is therefore single-quoted\n   individually \u2014 harmless for flags, mandatory for values. */\n\nconst inp = $input.first().json;\nconst stage = String(inp.stage ?? '').trim();\nconst month = String(inp.month ?? '').trim();\nconst label = String(inp.label ?? '').trim() || ('stage ' + stage);\n\n/* Reject rather than pass through. A malformed stage or month here means the\n   caller has a bug, and running SOMETHING is worse than running nothing. */\nif (!/^[0-9]{2}$/.test(stage)) throw new Error('stage must be two digits (\"00\"..\"07\"), got: ' + JSON.stringify(inp.stage));\nif (!/^[0-9]{4}-[0-9]{2}$/.test(month)) throw new Error('month must be YYYY-MM, got: ' + JSON.stringify(inp.month));\n\nconst repo = $vars.RBL_REPO;\nif (!repo) throw new Error('n8n variable RBL_REPO is not set \u2014 see n8n/SETUP_MONTH_PIPELINE.md');\n\n/* args is an array of tokens (preferred \u2014 a value containing a space survives)\n   or a string, split on whitespace. No flag the pipeline takes today has a\n   space in its value, so the string form is safe; the array form is there for\n   when one does. */\nlet args = inp.args ?? [];\nif (typeof args === 'string') args = args.trim() ? args.trim().split(/\\s+/) : [];\nif (!Array.isArray(args)) throw new Error('args must be a string or an array of tokens');\n\nconst q = (s) => \"'\" + String(s).replace(/'/g, \"'\\\\''\") + \"'\";\n\n/* --silent keeps npm's own banner off stdout. The parser takes the last line\n   beginning with \"{\" either way, but a clean stdout is easier to read in the\n   execution log when something has gone wrong. */\n/* THE SENTINEL IS NOT OPTIONAL, AND HERE IS THE MEASUREMENT.\n   Observed on n8n 2.35.7, Execute Command node typeVersion 1:\n\n     exit 0            -> { exitCode: 0, stdout: \"...\", stderr: \"...\" }\n     exit 10, stderr   -> { error: \"<the stderr text>\" }\n     exit 10, no stderr-> { error: \"Command failed with exit code 10\" }\n     exit 1            -> { error: \"<the stderr text>\" }\n\n   On ANY non-zero exit the node discards exitCode AND stdout and puts stderr\n   into `error`. Exit 10 and exit 1 are then indistinguishable, because every\n   stage writes progress to stderr through ctx.log \u2014 so the code is always\n   lost, and the JSON line the whole contract is built on is lost with it.\n   Un-sentinelled, every month containing a decision routes to the error\n   handler as a crash. `onError: continueRegularOutput` does not help: it keeps\n   the workflow running, it does not restore the fields.\n\n   So the command must never exit non-zero. Wrapping the pipeline in ( ) and\n   following it with printf makes printf the last command, the shell exits 0,\n   and the real code travels in stdout where nothing can strip it. This is the\n   __EXIT__ sentinel the old rbl-month workflow used; dropping it was based on\n   a belief about this node that is true only for exit 0.\n\n   The sentinel line does not begin with \"{\", so the \"last line starting with\n   {\" parser in Classify still finds the JSON. */\nconst inner = 'cd ' + q(repo)\n  + ' && npm run pipeline --silent -- --stage ' + q(stage)\n  + ' --month ' + q(month)\n  + ' --json'\n  + (args.length ? ' ' + args.map(q).join(' ') : '');\n\nconst command = '( ' + inner + \" ); printf '__EXIT__%s\\\\n' \\\"$?\\\"\";\n\nreturn [{ json: { stage, month, label, args, command, startedAt: Date.now() } }];"
+   },
+   "id": "sr-build",
+   "name": "Build command",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -200,
+    300
+   ],
+   "notes": "Validates the inputs and shell-quotes every token. The only place a value reaches a shell."
+  },
+  {
+   "parameters": {
+    "command": "={{ $json.command }}"
+   },
+   "id": "sr-run",
+   "name": "Run stage",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    20,
+    300
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "alwaysOutputData + continueRegularOutput so a non-zero exit still produces an item to classify. NOTE (measured, n8n 2.35.7): these settings keep the workflow running but do NOT restore exitCode or stdout, which this node drops on any non-zero exit. The __EXIT__ sentinel added by Build command is what actually carries the exit code \u2014 an exit 10 must not fail this node, and must not be mistaken for an exit 1."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* THE ONLY COPY of parse-and-classify in the whole system.\n\n   The workflow this replaces carried these same lines seven times, once per\n   stage (HANDOFF_N8N_MAX.md \u00a71, gap #2). A fix to exit-code handling had to be\n   made in seven places, and the eighth stage would have been written from\n   memory. Every stage now comes through here, so the contract is interpreted\n   identically everywhere and a fix lands once.\n\n   It also drops the old __EXIT__$? sentinel. The Execute Command node reports\n   the real exit code on its own output; echoing it into stdout and parsing it\n   back was a workaround for a problem n8n does not have, and it broke on any\n   stage whose output did not end exactly where the sentinel expected. */\n\nconst cmd = $('Run stage').first().json;\nconst meta = $('Build command').first().json;\n\n/* THE SENTINEL IS THE ONLY RELIABLE SOURCE OF THE EXIT CODE.\n   Measured on n8n 2.35.7: the Execute Command node reports `exitCode` only when\n   the command exits 0. On any non-zero exit it emits `{ error }` alone \u2014 no\n   exitCode, no stdout \u2014 with the stderr text as the error message, which makes\n   an exit 10 identical to an exit 1. Build command therefore wraps the stage so\n   the shell always exits 0 and prints `__EXIT__<code>` on stdout.\n\n   Order of trust:\n     1. the __EXIT__ sentinel   \u2014 survives every case\n     2. cmd.exitCode            \u2014 correct, but only ever present for 0\n     3. cmd.error ? 1 : 0       \u2014 last resort, and it CANNOT tell 10 from 1,\n                                  so it is reported as a contract violation\n                                  rather than quietly treated as a crash. */\nconst stdoutRaw = String(cmd.stdout ?? '');\nconst sentinel = [...stdoutRaw.matchAll(/^__EXIT__(\\d+)\\s*$/gm)].pop();\n\nlet exitCode;\nlet exitCodeSource;\nif (sentinel) {\n  exitCode = Number(sentinel[1]);\n  exitCodeSource = 'sentinel';\n} else if (Number.isFinite(Number(cmd.exitCode))) {\n  exitCode = Number(cmd.exitCode);\n  exitCodeSource = 'node';\n} else {\n  exitCode = cmd.error ? 1 : 0;\n  exitCodeSource = 'inferred';\n}\n\n/* Keep the sentinel out of everything downstream reads. */\nconst stdout = stdoutRaw.replace(/^__EXIT__\\d+\\s*$/gm, '');\nconst stderr = String(cmd.stderr ?? '') + (cmd.error ? '\\n' + String(cmd.error) : '');\nconst stderrTail = stderr.slice(-2000);\n\nconst jsonLine = stdout.split('\\n').map((l) => l.trim()).filter((l) => l.startsWith('{')).pop() || null;\nlet json = null;\nlet parseError = null;\nif (jsonLine) {\n  try { json = JSON.parse(jsonLine); } catch (e) { parseError = e.message; }\n}\n\n/* 0 = done \u00b7 10 = a human must decide \u00b7 anything else = crash.\n   A 10 is the pipeline working correctly and must never render red \u2014 hard rule\n   #5. This node only labels it; RBL \u00b7 Notify colours it and the caller decides\n   what it means. */\nlet outcome = exitCode === 0 ? 'done' : exitCode === 10 ? 'stop' : 'crash';\nlet contractViolation = null;\n\n/* No sentinel and no exitCode means the code was inferred from the presence of\n   an error string, and that inference cannot distinguish \"a human must decide\"\n   from \"the stage died\". Say so rather than let a decision be filed as a crash\n   \u2014 which is exactly what happened before the sentinel was restored. */\nif (exitCodeSource === 'inferred') {\n  outcome = 'crash';\n  contractViolation = 'stage ' + meta.stage + ' produced no __EXIT__ sentinel and no exitCode, so the real exit code is unknown'\n    + ' \u2014 an exit 10 (a human must decide) is indistinguishable from a crash in this shape. Check that Build command still'\n    + ' appends the sentinel; see the measurement in its comment.';\n}\n\nif (!jsonLine) {\n  if (outcome !== 'crash') {\n    /* Exiting 0 or 10 means the stage believes it finished, and a finished\n       stage's last stdout line is its JSON. Nothing downstream can proceed on\n       a claim with no payload. */\n    outcome = 'crash';\n    contractViolation = 'stage ' + meta.stage + ' exited ' + exitCode\n      + ' but printed no JSON line on stdout \u2014 that is itself a contract violation and is reported as a crash';\n  }\n  /* else: allowed. A stage that died before printing has nothing to print, and\n     the stderr tail is what the operator reads instead. */\n} else if (parseError) {\n  outcome = 'crash';\n  contractViolation = 'stage ' + meta.stage + ' printed a last JSON line that does not parse ('\n    + parseError + ') \u2014 that is itself a contract violation and is reported as a crash';\n}\n\n/* The uniform envelope. No branching here: the caller decides what a stop\n   means in its context (\u00a73.1). */\nreturn [{\n  json: {\n    ok: outcome === 'done',\n    stage: meta.stage,\n    month: meta.month,\n    label: meta.label,\n    exitCode,\n    exitCodeSource,\n    outcome,\n    json,\n    contractViolation,\n    stderrTail,\n    durationMs: Date.now() - Number(meta.startedAt || Date.now()),\n  },\n}];"
+   },
+   "id": "sr-classify",
+   "name": "Classify",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    240,
+    300
+   ],
+   "notes": "The single copy of the contract. Returns {ok, stage, month, label, exitCode, outcome, json, contractViolation, stderrTail, durationMs}."
+  }
+ ],
+ "connections": {
+  "When called by the Orchestrator": {
+   "main": [
+    [
+     {
+      "node": "Build command",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Build command": {
+   "main": [
+    [
+     {
+      "node": "Run stage",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Run stage": {
+   "main": [
+    [
+     {
+      "node": "Classify",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v1",
+  "executionTimeout": -1,
+  "saveExecutionProgress": true,
+  "saveDataSuccessExecution": "all",
+  "saveDataErrorExecution": "all",
+  "errorWorkflow": "rbl-error-handler"
+ },
+ "pinData": {},
+ "id": "rbl-stage-runner"
+}

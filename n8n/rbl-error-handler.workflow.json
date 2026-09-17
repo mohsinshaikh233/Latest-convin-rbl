@@ -1,0 +1,149 @@
+{
+ "id": "rbl-error-handler",
+ "name": "RBL \u00b7 Error Handler",
+ "nodes": [
+  {
+   "parameters": {},
+   "id": "eh-trigger",
+   "name": "On any workflow error",
+   "type": "n8n-nodes-base.errorTrigger",
+   "typeVersion": 1,
+   "position": [
+    -460,
+    300
+   ],
+   "notes": "Set as the Error Workflow in the settings of Orchestrator, Stage Runner, Cohort Loop and Notify."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* n8n hands an error workflow the failing execution, not our data. So the\n   month and runId have to be recovered, in this order:\n\n     1. execution.customData \u2014 the Orchestrator sets month and runId there for\n        exactly this reason (step 3 wires it: $execution.customData.set(...)).\n     2. $vars.RBL_MONTH \u2014 set only when re-running a specific month.\n     3. last month \u2014 the same default the Orchestrator resolves to.\n\n   If runId cannot be found, the release below runs WITHOUT --run-id, which\n   makes lock.mjs refuse to release a live foreign lock. That is the correct\n   outcome: releasing a lock we cannot prove is ours would leave two writers on\n   one month. The notification then says the lock is still held, which is a\n   thing a human can act on. */\n\nconst e = $input.first().json;\nconst execution = e.execution ?? {};\nconst workflow = e.workflow ?? {};\nconst custom = execution.customData ?? {};\n\nconst lastMonth = () => {\n  const d = new Date();\n  d.setDate(1);\n  d.setMonth(d.getMonth() - 1);\n  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');\n};\n\nconst month = String(custom.month || $vars.RBL_MONTH || lastMonth()).trim();\nconst runId = String(custom.runId || '').trim();\nconst stage = String(custom.stage || '').trim();\n\nconst err = execution.error ?? {};\nconst node = err.node?.name || execution.lastNodeExecuted || '(unknown node)';\nconst message = String(err.message || 'no message');\n/* The tail, not the head: the useful part of a stack or a stderr dump is the\n   end. Capped so a runaway log cannot fill a Slack message. */\nconst detail = String(err.stack || err.description || '').slice(-2000);\n\nconst crash = JSON.stringify({ node, message, stage, runId, executionUrl: execution.url || '', stderrTail: detail });\n\nconst q = (s) => \"'\" + String(s).replace(/'/g, \"'\\\\''\") + \"'\";\nconst repo = $vars.RBL_REPO;\nif (!repo) throw new Error('n8n variable RBL_REPO is not set \u2014 the Error Handler cannot release the lock');\n\nconst command = 'cd ' + q(repo)\n  + ' && npm run pipeline --silent -- --stage lock --month ' + q(month)\n  + ' --release'\n  + (runId ? ' --run-id ' + q(runId) : '')\n  + ' --crash ' + q(crash)\n  + ' --json';\n\nreturn [{\n  json: {\n    month, runId, stage, node, message, detail,\n    workflowName: workflow.name || '(unknown workflow)',\n    executionId: execution.id || '',\n    executionUrl: execution.url || '',\n    monthSource: custom.month ? 'execution.customData' : ($vars.RBL_MONTH ? '$vars.RBL_MONTH' : 'computed as last month'),\n    command,\n  },\n}];"
+   },
+   "id": "eh-extract",
+   "name": "Extract the failure",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    -240,
+    300
+   ],
+   "notes": "Recovers month/runId from execution.customData, then $vars.RBL_MONTH, then last month. Builds the quoted release command."
+  },
+  {
+   "parameters": {
+    "command": "=( {{ $json.command }} ); printf '__EXIT__%s\\n' \"$?\""
+   },
+   "id": "eh-release",
+   "name": "Release the lock",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    -20,
+    300
+   ],
+   "alwaysOutputData": true,
+   "onError": "continueRegularOutput",
+   "notes": "Releases the month lock and records {crashedAt, node, message} into state/<month>.json. Never allowed to stop the notification: an unreleased lock is bad, an unreported crash is worse. The command is wrapped so the shell always exits 0 and the real code travels in stdout as __EXIT__<code>. Measured on n8n 2.35.7: this node reports exitCode ONLY when the command exits 0 \u2014 on any non-zero exit it emits { error } alone, dropping both exitCode and stdout, with the stderr text as the message. That makes an exit 10 (a human must decide) indistinguishable from a crash, and loses the JSON line the contract is built on. onError:continueRegularOutput keeps the workflow running but does not restore the fields."
+  },
+  {
+   "parameters": {
+    "jsCode": "/* Did the lock actually come off? This is the question the next scheduled run\n   depends on: a crash that leaves the lock held wedges it, and the failure a\n   month later points at a process that died in October. */\nconst meta = $('Extract the failure').first().json;\nconst out = $('Release the lock').first().json;\n\n/* THE SENTINEL IS THE ONLY RELIABLE EXIT CODE. Measured on n8n 2.35.7: the\n   Execute Command node reports `exitCode` only when the command exits 0. On any\n   non-zero exit it emits `{ error }` alone \u2014 no exitCode, no stdout \u2014 so a\n   lock.mjs exit 10 (\"someone else holds this month\", a decision) is\n   indistinguishable from a crash. The command is wrapped to always exit 0 and\n   print __EXIT__<code> on stdout. */\nconst stdoutRaw = String(out.stdout ?? '');\nconst sentinelMatch = [...stdoutRaw.matchAll(/^__EXIT__(\\d+)\\s*$/gm)].pop();\nconst exitCode = sentinelMatch ? Number(sentinelMatch[1])\n  : (Number.isFinite(Number(out.exitCode)) ? Number(out.exitCode) : (out.error ? 1 : 0));\nconst stdout = stdoutRaw.replace(/^__EXIT__\\d+\\s*$/gm, '');\nconst line = stdout.split('\\n').map((l) => l.trim()).filter((l) => l.startsWith('{')).pop();\nlet res = null;\ntry { res = line ? JSON.parse(line) : null; } catch (err) { res = null; }\n\nconst released = res?.released === true;\nconst nothingHeld = res?.released === false && /no lock was held/i.test(res?.reason ?? '');\nconst lockNote = released\n  ? 'Month lock released.'\n  : nothingHeld\n    ? 'No month lock was held.'\n    : 'MONTH LOCK NOT RELEASED (exit ' + exitCode + ') \u2014 ' + (res?.reason ?? 'the release command produced no parseable result') +\n      '\\nThe next scheduled run for ' + meta.month + ' will refuse to start until this is cleared:' +\n      '\\n  npm run pipeline -- --stage lock --month ' + meta.month + ' --status';\n\nconst body = [\n  meta.workflowName + ' failed at \"' + meta.node + '\".',\n  '',\n  meta.message,\n  '',\n  lockNote,\n  '',\n  'Month resolved from: ' + meta.monthSource,\n  meta.runId ? '' : 'No runId was recoverable from the failed execution \u2014 see the Orchestrator note about execution.customData.',\n  '',\n  meta.detail ? '--- tail ---' : '',\n  meta.detail,\n].filter((l) => l !== '').join('\\n');\n\nreturn [{\n  json: {\n    severity: 'fail',\n    runId: meta.runId || '(no runId)',\n    month: meta.month,\n    stage: meta.stage,\n    title: 'crash in ' + meta.workflowName,\n    body,\n    executionUrl: meta.executionUrl,\n    resumeUrl: '',\n    attachments: '',\n    lockReleased: released,\n    lockResult: res,\n  },\n}];"
+   },
+   "id": "eh-after",
+   "name": "Did the lock come off?",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    200,
+    300
+   ],
+   "notes": "If the lock is still held, the alert says so and gives the command to clear it."
+  },
+  {
+   "parameters": {
+    "workflowId": {
+     "__rl": true,
+     "value": "rbl-notify",
+     "mode": "list",
+     "cachedResultName": "RBL \u00b7 Notify"
+    },
+    "workflowInputs": {
+     "mappingMode": "defineBelow",
+     "value": {
+      "severity": "={{ $json.severity }}",
+      "runId": "={{ $json.runId }}",
+      "month": "={{ $json.month }}",
+      "stage": "={{ $json.stage }}",
+      "title": "={{ $json.title }}",
+      "body": "={{ $json.body }}",
+      "resumeUrl": "={{ $json.resumeUrl }}",
+      "executionUrl": "={{ $json.executionUrl }}",
+      "attachments": "={{ $json.attachments }}"
+     }
+    },
+    "options": {}
+   },
+   "id": "eh-notify",
+   "name": "Notify at fail",
+   "type": "n8n-nodes-base.executeWorkflow",
+   "typeVersion": 1.2,
+   "position": [
+    420,
+    300
+   ],
+   "notes": "Import RBL \u00b7 Notify first \u2014 this node needs its ID to exist."
+  }
+ ],
+ "connections": {
+  "On any workflow error": {
+   "main": [
+    [
+     {
+      "node": "Extract the failure",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Extract the failure": {
+   "main": [
+    [
+     {
+      "node": "Release the lock",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Release the lock": {
+   "main": [
+    [
+     {
+      "node": "Did the lock come off?",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Did the lock come off?": {
+   "main": [
+    [
+     {
+      "node": "Notify at fail",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v1",
+  "saveExecutionProgress": true,
+  "saveDataSuccessExecution": "all",
+  "saveDataErrorExecution": "all"
+ },
+ "pinData": {}
+}
